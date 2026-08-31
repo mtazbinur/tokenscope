@@ -6,6 +6,21 @@ and this file is the canonical version reference.
 TokenScope's history starts at v1.0.0 — the entries of the project it grew out of
 are not carried over here.
 
+## v1.2.0 — 2026-09-01
+
+### Dashboard
+
+- Added a **Sign in to Claude Code** button to the usage panel. It runs `claude auth login` on the server and watches for the renewed credential, so a expired sign-in no longer means a trip to the terminal. The route is gated on a loopback bind and a same-origin control token, and is hidden where the Claude Code CLI isn't installed.
+- Fixed the usage panel's freshness label (`Local · 1:…`) being permanently truncated. The heading row carried the title, the timestamp and the refresh button in ~200px of sidebar, so the ellipsis always fired; the timestamp now sits on its own line and the title fits on one.
+- Auth messages state what happened and let the surface supply the remedy, instead of hardcoding "run `claude auth login`" next to a button that does it.
+
+### Scanner
+
+- Fixed a signed-in user being reported as signed out. A locally-expired `expiresAt` is now verified against `/api/oauth/profile` before the panel claims the sign-in expired — the CLI and desktop app renew in-process and don't always write the new token back to the store TokenScope reads.
+- `_refresh_credentials_via_cli` judges a refresh by whether the stored credential actually moved forward, not by the CLI's `loggedIn` field, which reports success for an exchange that never happened.
+- A probe that fails (timeout, 429, 5xx) now reports "could not confirm" and keeps the last reading, instead of showing an expired-sign-in error and a sign-in button.
+- Both credential stores (Keychain and `~/.claude/.credentials.json`) are read, and the freshest wins; a broken store no longer hides a working one.
+
 ## v1.1.0 — 2026-08-31
 
 ### Settings

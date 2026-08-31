@@ -6,10 +6,14 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 from scanner import get_db, init_db, upsert_sessions, insert_turns, SOURCE_CLAUDE, SOURCE_CODEX
+import dashboard
+import quota
 from dashboard import get_dashboard_data, DashboardHandler, HTML_TEMPLATE
 
 try:
@@ -441,6 +445,75 @@ class TestDashboardHTTP(unittest.TestCase):
             data = json.loads(resp.read())
             # Should have expected keys (or error if no DB)
             self.assertTrue("all_models" in data or "error" in data)
+
+    # ── Sign-in route ──────────────────────────────────────────────────────
+    # The route spawns `claude auth login`, so its gates matter more than its
+    # payload: an unauthenticated localhost server must not let any page in the
+    # browser start a login, and a LAN-exposed one must not offer it at all.
+
+    def _signin(self, method="GET", token=dashboard.CONTROL_TOKEN):
+        url = f"http://127.0.0.1:{self.port}/api/signin"
+        headers = {} if token is None else {dashboard.CONTROL_TOKEN_HEADER: token}
+        req = urllib.request.Request(url, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_signin_status_requires_the_control_token(self):
+        self.assertEqual(self._signin(token=None)[0], 403)
+        self.assertEqual(self._signin(token="wrong")[0], 403)
+
+    def test_signin_status_is_served_with_the_control_token(self):
+        status, payload = self._signin()
+        self.assertEqual(status, 200)
+        self.assertIn(payload["status"], ("idle", "running", "ok", "failed", "unavailable"))
+
+    def test_signin_start_requires_the_control_token(self):
+        with patch.object(quota, "start_sign_in") as start:
+            self.assertEqual(self._signin("POST", token=None)[0], 403)
+            self.assertEqual(self._signin("POST", token="wrong")[0], 403)
+        start.assert_not_called()
+
+    def test_signin_start_is_refused_off_loopback(self):
+        """A dashboard on 0.0.0.0 must not spawn a login for the whole LAN."""
+        with patch.object(dashboard, "SERVE_HOST", "0.0.0.0"), \
+             patch.object(quota, "start_sign_in") as start:
+            status, _ = self._signin("POST")
+        self.assertEqual(status, 403)
+        start.assert_not_called()
+
+    def test_signin_start_reports_a_missing_cli(self):
+        with patch.object(quota, "sign_in_available", return_value=False), \
+             patch.object(quota, "start_sign_in") as start:
+            status, payload = self._signin("POST")
+        self.assertEqual(status, 501)
+        self.assertIn("error", payload)
+        start.assert_not_called()
+
+    def test_signin_start_accepts_and_returns_immediately(self):
+        """202: the browser half of the flow outlives the response."""
+        state = {"status": "running", "message": "…", "url": "", "started_at": 0.0, "available": True}
+        with patch.object(quota, "sign_in_available", return_value=True), \
+             patch.object(quota, "start_sign_in", return_value=state) as start:
+            status, payload = self._signin("POST")
+        self.assertEqual(status, 202)
+        self.assertEqual(payload["status"], "running")
+        start.assert_called_once()
+
+    def test_page_carries_the_control_token_and_capability(self):
+        url = f"http://127.0.0.1:{self.port}/"
+        with urllib.request.urlopen(url) as resp:
+            html = resp.read().decode("utf-8")
+        self.assertIn(dashboard.CONTROL_TOKEN, html)
+        self.assertIn('"canSignIn"', html)
+
+    def test_signin_is_not_offered_off_loopback(self):
+        with patch.object(dashboard, "SERVE_HOST", "0.0.0.0"):
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/") as resp:
+                html = resp.read().decode("utf-8")
+        self.assertIn('"canSignIn": false', html)
 
     def test_api_rescan_returns_json(self):
         url = f"http://127.0.0.1:{self.port}/api/rescan"

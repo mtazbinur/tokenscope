@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -30,6 +31,18 @@ def _usage_response(utilization):
                 "five_hour": {"utilization": utilization, "resets_at": "2026-08-31T10:00:00Z"},
                 "seven_day": {"utilization": 11, "resets_at": "2026-09-07T05:00:00Z"},
             }).encode("utf-8")
+
+    return [Response()]
+
+
+def _ok_response():
+    """One urlopen result for a probe that only cares about the status code."""
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
 
     return [Response()]
 
@@ -189,8 +202,11 @@ class TestQuotaSnapshot(unittest.TestCase):
 
         self.assertEqual([window["key"] for window in snapshot["windows"]], ["weekly"])
 
-    def test_expired_credential_is_reported_without_calling_the_api(self):
+    def test_rejected_credential_is_reported_without_calling_the_usage_api(self):
+        """A token the API rejects is a real sign-out, and costs no usage call."""
         with patch("quota._claude_credentials", return_value=("token", time.time() - 10)), \
+             patch("quota._refresh_credentials_via_cli", return_value=False), \
+             patch("quota._token_is_live", return_value=False), \
              patch("quota.urllib.request.urlopen") as urlopen, \
              patch("quota._CLAUDE_API_CACHE", None), \
              patch("quota._CLAUDE_API_RETRY_AFTER", 0.0), \
@@ -200,6 +216,50 @@ class TestQuotaSnapshot(unittest.TestCase):
         urlopen.assert_not_called()
         self.assertFalse(snapshot["available"])
         self.assertEqual(snapshot["message"], quota.AUTH_FAILED_MESSAGE)
+
+    def test_stale_expiry_on_an_accepted_token_still_reads_usage(self):
+        """The regression this guards: a signed-in user reported as signed out.
+
+        The CLI and desktop app renew in-process and do not always write the new
+        access token back to the store, so `expiresAt` sits in the past while the
+        token itself is still accepted.  That must not surface as an auth error.
+        """
+        with patch("quota._claude_credentials", return_value=("token", time.time() - 10)), \
+             patch("quota._refresh_credentials_via_cli", return_value=False), \
+             patch("quota._token_is_live", return_value=True), \
+             patch("quota.urllib.request.urlopen", side_effect=_usage_response(30)), \
+             patch("quota._CLAUDE_API_CACHE", None), \
+             patch("quota._CLAUDE_API_CACHE_AT", 0.0), \
+             patch("quota._CLAUDE_API_RETRY_AFTER", 0.0):
+            snapshot = get_quota_snapshot("claude_code", claude_dirs=[self.root], force_refresh=True)
+
+        self.assertEqual(snapshot["source"], "live_api")
+        self.assertEqual(snapshot["windows"][0]["remaining_percent"], 70.0)
+
+    def test_unverifiable_credential_does_not_accuse_the_user_of_signing_out(self):
+        """Probe failed, so the verdict is "unknown" — not "expired"."""
+        with patch("quota._claude_credentials", return_value=("token", time.time() - 10)), \
+             patch("quota._refresh_credentials_via_cli", return_value=False), \
+             patch("quota._token_is_live", return_value=None), \
+             patch("quota._CLAUDE_API_CACHE", None), \
+             patch("quota._CLAUDE_API_RETRY_AFTER", 0.0), \
+             patch("quota._load_disk_snapshot", return_value=None):
+            snapshot = get_quota_snapshot("claude_code", claude_dirs=[self.root], force_refresh=True)
+
+        self.assertEqual(snapshot["message"], quota.CREDENTIAL_STALE_MESSAGE)
+        self.assertFalse(snapshot["needs_sign_in"])
+
+    def test_unreadable_credential_store_is_not_a_sign_out(self):
+        with patch("quota._claude_credentials", side_effect=RuntimeError("keychain locked")), \
+             patch("quota.urllib.request.urlopen") as urlopen, \
+             patch("quota._CLAUDE_API_CACHE", None), \
+             patch("quota._CLAUDE_API_RETRY_AFTER", 0.0), \
+             patch("quota._load_disk_snapshot", return_value=None):
+            snapshot = get_quota_snapshot("claude_code", claude_dirs=[self.root], force_refresh=True)
+
+        urlopen.assert_not_called()
+        self.assertEqual(snapshot["message"], quota.CREDENTIAL_STALE_MESSAGE)
+        self.assertFalse(snapshot["needs_sign_in"])
 
     def test_rate_limited_refresh_keeps_the_last_good_snapshot(self):
         cached = {
@@ -265,6 +325,7 @@ class TestQuotaSnapshot(unittest.TestCase):
     def test_sign_in_is_offered_only_when_the_refresh_fails(self):
         with patch("quota._claude_credentials", return_value=("stale", time.time() - 10)), \
              patch("quota._refresh_credentials_via_cli", return_value=False), \
+             patch("quota._token_is_live", return_value=False), \
              patch("quota.urllib.request.urlopen") as urlopen, \
              patch("quota._CLAUDE_API_CACHE", None), \
              patch("quota._CLAUDE_API_RETRY_AFTER", 0.0):
@@ -275,14 +336,174 @@ class TestQuotaSnapshot(unittest.TestCase):
         self.assertEqual(snapshot["message"], quota.AUTH_FAILED_MESSAGE)
 
     def test_cli_refresh_is_throttled(self):
-        with patch("quota.shutil.which", return_value="/usr/local/bin/claude"), \
+        with patch("quota._claude_cli", return_value="/usr/local/bin/claude"), \
              patch("quota.subprocess.run") as run, \
+             patch("quota._claude_credentials", return_value=("fresh", time.time() + 3600)), \
              patch("quota._LAST_CLI_REFRESH_AT", 0.0):
             run.return_value = type("R", (), {"returncode": 0, "stdout": '{"loggedIn": true}'})()
             self.assertTrue(quota._refresh_credentials_via_cli())
             # A second attempt inside the interval must not re-spawn the CLI.
             self.assertFalse(quota._refresh_credentials_via_cli())
             self.assertEqual(run.call_count, 1)
+
+    def test_cli_refresh_reports_failure_when_the_credential_did_not_move(self):
+        """`loggedIn: true` is not evidence of a refresh.
+
+        On installs where `auth status` answers from cached state without doing
+        a token exchange, trusting that field reported success for a renewal
+        that never happened — and the caller then declared the user signed out.
+        """
+        with patch("quota._claude_cli", return_value="/usr/local/bin/claude"), \
+             patch("quota.subprocess.run") as run, \
+             patch("quota._claude_credentials", return_value=("stale", time.time() - 10)), \
+             patch("quota._LAST_CLI_REFRESH_AT", 0.0):
+            run.return_value = type("R", (), {"returncode": 0, "stdout": '{"loggedIn": true}'})()
+            self.assertFalse(quota._refresh_credentials_via_cli())
+
+    def test_cli_refresh_survives_a_cli_that_will_not_run(self):
+        with patch("quota._claude_cli", return_value="/usr/local/bin/claude"), \
+             patch("quota.subprocess.run", side_effect=OSError("boom")), \
+             patch("quota._LAST_CLI_REFRESH_AT", 0.0):
+            self.assertFalse(quota._refresh_credentials_via_cli())
+
+
+class TestSignIn(unittest.TestCase):
+    """The dashboard's sign-in button, minus the browser."""
+
+    def setUp(self):
+        quota._SIGN_IN_STATE.update({"status": "idle", "message": "", "url": "", "started_at": 0.0})
+        quota._PROBE_CACHE.clear()
+
+    tearDown = setUp
+
+    def test_unavailable_without_the_cli(self):
+        with patch("quota._claude_cli", return_value=""):
+            state = quota.start_sign_in()
+        self.assertEqual(state["status"], "unavailable")
+        self.assertFalse(state["available"])
+
+    def test_a_second_press_does_not_start_a_second_login(self):
+        """Two tabs, or an impatient double-click, must not race two flows."""
+        quota._SIGN_IN_STATE["status"] = "running"
+        with patch("quota._claude_cli", return_value="/usr/local/bin/claude"), \
+             patch("quota.threading.Thread") as thread:
+            state = quota.start_sign_in()
+        thread.assert_not_called()
+        self.assertEqual(state["status"], "running")
+
+    def test_success_is_judged_by_the_credential_not_the_exit_code(self):
+        with patch("quota._claude_credentials", return_value=("fresh", time.time() + 3600)):
+            quota._finish_sign_in(0)
+        self.assertEqual(quota.sign_in_state()["status"], "ok")
+
+    def test_exit_zero_without_a_usable_credential_is_a_failure(self):
+        with patch("quota._claude_credentials", return_value=("stale", time.time() - 10)):
+            quota._finish_sign_in(0)
+        self.assertEqual(quota.sign_in_state()["status"], "failed")
+
+    def test_a_killed_login_reports_the_timeout(self):
+        with patch("quota._claude_credentials", return_value=("", None)):
+            quota._finish_sign_in(-9)   # negative == killed by the watchdog
+        state = quota.sign_in_state()
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["message"], quota.SIGN_IN_TIMEOUT_MESSAGE)
+
+    def test_an_unreadable_store_after_login_is_a_failure_not_a_crash(self):
+        with patch("quota._claude_credentials", side_effect=RuntimeError("keychain locked")):
+            quota._finish_sign_in(0)
+        self.assertEqual(quota.sign_in_state()["status"], "failed")
+
+    def test_a_successful_sign_in_clears_the_auth_back_off(self):
+        """Otherwise the panel keeps serving the auth error for five more minutes."""
+        quota._PROBE_CACHE["stale"] = (time.monotonic(), False)
+        with patch("quota._CLAUDE_API_RETRY_AFTER", time.monotonic() + 300), \
+             patch("quota._claude_credentials", return_value=("fresh", time.time() + 3600)):
+            quota._finish_sign_in(0)
+            self.assertEqual(quota._CLAUDE_API_RETRY_AFTER, 0.0)
+        self.assertEqual(quota._PROBE_CACHE, {})
+
+    def test_a_login_that_cannot_be_spawned_is_reported(self):
+        with patch("quota._claude_cli", return_value="/usr/local/bin/claude"), \
+             patch("quota.subprocess.Popen", side_effect=OSError("no exec")):
+            quota._run_sign_in()
+        self.assertEqual(quota.sign_in_state()["status"], "failed")
+
+
+class TestTokenProbe(unittest.TestCase):
+    """`_token_is_live` must answer three ways, never two."""
+
+    def setUp(self):
+        quota._PROBE_CACHE.clear()
+
+    tearDown = setUp
+
+    def _probe(self, side_effect):
+        with patch("quota.urllib.request.urlopen", side_effect=side_effect):
+            return quota._token_is_live("token")
+
+    def test_accepted_token(self):
+        self.assertIs(self._probe(_ok_response()), True)
+
+    def test_rejected_token(self):
+        error = urllib.error.HTTPError(quota.CLAUDE_PROFILE_URL, 401, "Unauthorized", {}, None)
+        self.assertIs(self._probe(error), False)
+
+    def test_throttled_probe_is_unknown_not_rejected(self):
+        error = urllib.error.HTTPError(quota.CLAUDE_PROFILE_URL, 429, "Too Many Requests", {}, None)
+        self.assertIsNone(self._probe(error))
+
+    def test_server_error_is_unknown(self):
+        error = urllib.error.HTTPError(quota.CLAUDE_PROFILE_URL, 503, "Unavailable", {}, None)
+        self.assertIsNone(self._probe(error))
+
+    def test_network_failure_is_unknown(self):
+        self.assertIsNone(self._probe(OSError("no route to host")))
+
+    def test_verdicts_are_cached_but_unknown_is_not(self):
+        with patch("quota.urllib.request.urlopen", side_effect=_ok_response()) as urlopen:
+            quota._token_is_live("token")
+            quota._token_is_live("token")
+            self.assertEqual(urlopen.call_count, 1)
+
+        quota._PROBE_CACHE.clear()
+        with patch("quota.urllib.request.urlopen", side_effect=OSError("down")) as urlopen:
+            quota._token_is_live("token")
+            quota._token_is_live("token")
+            # "Unknown" must stay retryable, or one blip freezes the panel.
+            self.assertEqual(urlopen.call_count, 2)
+
+
+class TestCredentialStores(unittest.TestCase):
+    """Both stores are read; the freshest credential wins."""
+
+    @staticmethod
+    def _blob(token, expires_at):
+        return json.dumps({"claudeAiOauth": {"accessToken": token, "expiresAt": expires_at}})
+
+    def test_file_wins_when_the_keychain_copy_is_stale(self):
+        stale = self._blob("stale", (time.time() - 10) * 1000)
+        fresh = self._blob("fresh", (time.time() + 3600) * 1000)
+        with patch.dict(os.environ, {}, clear=False), \
+             patch("quota.os.environ.get", return_value=""), \
+             patch("quota._keychain_blob", return_value=stale), \
+             patch("quota._credentials_file_blob", return_value=fresh):
+            token, expires_at = quota._claude_credentials()
+        self.assertEqual(token, "fresh")
+        self.assertFalse(quota._is_expired(expires_at))
+
+    def test_a_broken_store_does_not_hide_a_working_one(self):
+        fresh = self._blob("fresh", (time.time() + 3600) * 1000)
+        with patch("quota.os.environ.get", return_value=""), \
+             patch("quota._keychain_blob", side_effect=RuntimeError("keychain locked")), \
+             patch("quota._credentials_file_blob", return_value=fresh):
+            token, _ = quota._claude_credentials()
+        self.assertEqual(token, "fresh")
+
+    def test_no_credential_anywhere(self):
+        with patch("quota.os.environ.get", return_value=""), \
+             patch("quota._keychain_blob", return_value=""), \
+             patch("quota._credentials_file_blob", return_value="not json"):
+            self.assertEqual(quota._claude_credentials(), ("", None))
 
 
 class TestStaleClaudeSnapshot(unittest.TestCase):

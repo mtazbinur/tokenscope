@@ -16,7 +16,7 @@ from pricing import is_long_context
 # and the dashboard footer. CHANGELOG.md is the canonical version reference, but
 # the runtime version has to live here as a constant. Keep this in lockstep with
 # the top CHANGELOG heading (see tests/test_version.py).
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 SOURCE_CLAUDE = "claude_code"
 SOURCE_CODEX = "codex"

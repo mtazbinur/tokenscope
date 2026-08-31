@@ -2,8 +2,10 @@
 dashboard.py - Local web dashboard served on localhost:8080.
 """
 
+import ipaddress
 import json
 import os
+import secrets
 import sqlite3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -15,9 +17,39 @@ import scanner
 import settings
 from scanner import VERSION, SOURCE_CLAUDE, SOURCE_CODEX, init_db
 from pricing import BUILTIN_PRICING_BY_SOURCE, calc_cost
+import quota
 from quota import get_quota_snapshot
 
 DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usage.db"))
+
+# The sign-in route spawns a process, so it is not something any page in the
+# user's browser may trigger.  Two gates guard it: the server must be bound to
+# loopback, and the caller must present this token.  The token is embedded in
+# the page (window.APP_CONFIG), which a cross-origin page cannot read — there
+# are no cookies here, so same-origin readability *is* the authentication.
+CONTROL_TOKEN = secrets.token_urlsafe(32)
+CONTROL_TOKEN_HEADER = "X-Tokenscope-Control"
+
+# Set by serve(); the default matches serve()'s own default bind.
+SERVE_HOST = "localhost"
+
+
+def is_loopback_host(host):
+    """True when `host` binds only to this machine.
+
+    An empty host, "0.0.0.0" or "::" means every interface, so a sign-in button
+    would be reachable from the LAN — that must not spawn a login on someone
+    else's behalf, nor hand out a live authorize URL.
+    """
+    if host is None:
+        return False
+    name = host.strip().strip("[]").lower()
+    if name in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
 
 SOURCE_CONFIG = {
     SOURCE_CLAUDE: {
@@ -418,11 +450,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     border-radius: 8px;
     animation: rise-in 360ms both;
   }
-  .quota-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
+  .quota-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 3px; }
   .quota-title { color: var(--muted-strong); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
   .quota-title::before { content: ""; display: inline-block; width: 6px; height: 6px; margin: 0 6px 1px 0; border-radius: 50%; background: var(--provider-accent); box-shadow: 0 0 0 3px var(--provider-accent-soft); }
-  .quota-heading-actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
-  .quota-updated { color: var(--muted); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .quota-heading-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+  /* The reading's provenance sits on its own line. Sharing the heading row with
+     a two-line title and the refresh button over-subscribed ~200px of sidebar,
+     so the ellipsis always fired and the timestamp was never readable. Given
+     the full width back, the title also settles onto one line — the panel is
+     no taller than before. */
+  .quota-updated { display: block; margin-bottom: 9px; color: var(--muted); font-size: 9px; line-height: 1.4; font-variant-numeric: tabular-nums; }
   .quota-refresh { width: 22px; height: 22px; flex: 0 0 22px; display: grid; place-items: center; padding: 0; border: 1px solid var(--border); border-radius: 5px; background: transparent; color: var(--muted-strong); cursor: pointer; font: inherit; font-size: 14px; line-height: 1; transition: background 140ms ease, color 140ms ease, border-color 140ms ease; }
   .quota-refresh:hover { color: var(--text); background: var(--raised); border-color: var(--border-strong); }
   .quota-refresh:focus-visible { outline: 2px solid var(--provider-accent); outline-offset: 2px; }
@@ -438,6 +475,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .quota-signin { display: block; margin-top: 8px; padding: 5px 10px; border: 1px solid var(--border-strong); border-radius: 5px; background: var(--raised); color: var(--text); font: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
   .quota-signin:hover { border-color: var(--provider-accent); }
   .quota-signin:focus-visible { outline: 2px solid var(--provider-accent); outline-offset: 2px; }
+  .quota-signin:disabled { opacity: 0.6; cursor: progress; }
+  /* Shown only if the CLI could not open a browser itself. */
+  .quota-authhint { display: block; margin-top: 6px; color: var(--muted); font-size: 10px; line-height: 1.45; }
+  .quota-authhint code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: var(--muted-strong); }
+  .quota-authlink { display: block; margin-top: 6px; color: var(--provider-accent); font-size: 10px; line-height: 1.4; word-break: break-all; }
   .quota-note { color: var(--muted); font-size: 10px; line-height: 1.4; padding: 7px 0 0; border-top: 1px solid var(--border-soft); }
   .quota-empty { color: var(--muted); font-size: 11px; line-height: 1.45; padding: 4px 0 2px; }
   .quota-empty strong { display: block; color: var(--muted-strong); font-size: 11px; font-weight: 600; margin-bottom: 2px; }
@@ -754,7 +796,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <button class="source-tab" id="tab-codex" role="tab" aria-selected="false" aria-controls="dashboard-panel" onclick="setSource('codex')">Codex</button>
   </div>
   <section class="quota-panel" id="quota-panel" aria-labelledby="quota-title">
-    <div class="quota-heading"><span class="quota-title" id="quota-title">Usage remaining</span><span class="quota-heading-actions"><span class="quota-updated" id="quota-updated">Loading</span><button class="quota-refresh" id="quota-refresh" type="button" aria-label="Refresh usage limits" title="Refresh usage limits" onclick="refreshQuota()">&#x21bb;</button></span></div>
+    <div class="quota-heading"><span class="quota-title" id="quota-title">Usage remaining</span><span class="quota-heading-actions"><button class="quota-refresh" id="quota-refresh" type="button" aria-label="Refresh usage limits" title="Refresh usage limits" onclick="refreshQuota()">&#x21bb;</button></span></div>
+    <span class="quota-updated" id="quota-updated">Loading</span>
     <div class="quota-rows" id="quota-rows"><div class="quota-empty"><strong>Loading limits</strong>Reading the latest local usage signal.</div></div>
   </section>
   <div class="meta" id="meta">Loading...</div>
@@ -1043,14 +1086,22 @@ function renderQuota(quota) {
   const windows = quota && Array.isArray(quota.windows) ? quota.windows : [];
   if (title) title.textContent = (quota && quota.title) || 'Usage remaining';
   if (!windows.length) {
-    // Only a credential problem is user-fixable, so only that state gets a button.
-    // Retrying re-runs the server-side credential refresh, which is all a
-    // signed-out user needs once they have run `claude auth login`.
-    const action = quota && quota.needs_sign_in
-      ? '<button class="quota-signin" type="button" onclick="refreshQuota(true)">Retry sign-in</button>'
-      : '';
+    // Only a credential problem is user-fixable, so only that state gets an
+    // action. Where the Claude Code CLI is present and we are on loopback, the
+    // button runs the real sign-in; otherwise it can only re-poll, and says so.
+    // The remedy depends on what this machine can actually do: start the flow
+    // here, or tell the user where to start it. An empty state is an invitation
+    // to act, so it always ends in one.
+    let action = '';
+    if (quota && quota.needs_sign_in) {
+      action = APP_CONFIG.canSignIn
+        ? '<button class="quota-signin" type="button" onclick="startSignIn()">Sign in to Claude Code</button>'
+        : '<span class="quota-authhint">Run <code>claude auth login</code> in your terminal, then check again.</span>'
+          + '<button class="quota-signin" type="button" onclick="refreshQuota(true)">Check again</button>';
+    }
     rows.innerHTML = '<div class="quota-empty"><strong>Usage unavailable</strong>'
-      + esc((quota && quota.message) || 'No recent local quota signal.') + action + '</div>';
+      + esc((quota && quota.message) || 'No recent local quota signal.')
+      + action + '</div>';
     if (updated) updated.textContent = 'Unavailable';
     return;
   }
@@ -1073,6 +1124,78 @@ function renderQuota(quota) {
       ? sourceLabel + ' · ' + observed.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
       : sourceLabel;
   }
+}
+
+// ── Sign-in ────────────────────────────────────────────────────────────────
+// The dashboard never handles a token. It asks the server to run
+// `claude auth login`, which owns the browser flow and writes its own
+// credential; we only watch for the result. See quota.start_sign_in.
+const SIGN_IN_POLL_MS = 1500;
+const SIGN_IN_GIVE_UP_MS = 5 * 60 * 1000;
+let signInPollTimer = null;
+
+function controlHeaders() {
+  return { 'Content-Type': 'application/json', 'X-Tokenscope-Control': APP_CONFIG.controlToken || '' };
+}
+
+function renderSignIn(state) {
+  const rows = document.getElementById('quota-rows');
+  if (!rows) return;
+  const running = state.status === 'running';
+  // The action keeps its name across the flow, so the button the user pressed
+  // is still recognisably the same control while it works.
+  const label = running ? 'Signing in\u2026' : 'Sign in to Claude Code';
+  // Heading names the state, body says what to do about it — neither repeats
+  // the other.
+  const heading = running ? 'Waiting for your browser' : 'Sign-in didn\u2019t finish';
+  const link = running && state.url
+    ? '<a class="quota-authlink" href="' + esc(state.url) + '" target="_blank" rel="noopener">'
+      + 'Open the sign-in page manually</a>'
+    : '';
+  rows.innerHTML = '<div class="quota-empty"><strong>' + esc(heading) + '</strong>'
+    + esc(state.message || '')
+    + '<button class="quota-signin" type="button" onclick="startSignIn()"' + (running ? ' disabled' : '')
+    + '>' + label + '</button>' + link + '</div>';
+}
+
+async function startSignIn() {
+  if (signInPollTimer) return;  // single-flight, mirroring the server's own lock
+  try {
+    const resp = await fetch('/api/signin', { method: 'POST', headers: controlHeaders() });
+    const state = await resp.json();
+    if (!resp.ok) {
+      renderSignIn({ status: 'failed', message: state.error || 'Could not start sign-in.' });
+      return;
+    }
+    renderSignIn(state);
+    pollSignIn(Date.now());
+  } catch (e) {
+    renderSignIn({ status: 'failed', message: 'Could not reach the dashboard server.' });
+  }
+}
+
+function pollSignIn(startedAt) {
+  signInPollTimer = setTimeout(async () => {
+    signInPollTimer = null;
+    try {
+      const resp = await fetch('/api/signin', { headers: controlHeaders() });
+      const state = await resp.json();
+      if (resp.ok && state.status === 'running') {
+        renderSignIn(state);
+        // A flow left open forever would poll forever; stop and let the user retry.
+        if (Date.now() - startedAt < SIGN_IN_GIVE_UP_MS) pollSignIn(startedAt);
+        else renderSignIn({ status: 'failed', message: 'Sign-in timed out. Try again.' });
+        return;
+      }
+      if (resp.ok && state.status === 'ok') {
+        refreshQuota(true);   // credential is good; let the panel repopulate
+        return;
+      }
+      renderSignIn({ status: 'failed', message: (state && (state.message || state.error)) || 'Sign-in did not complete.' });
+    } catch (e) {
+      renderSignIn({ status: 'failed', message: 'Could not reach the dashboard server.' });
+    }
+  }, SIGN_IN_POLL_MS);
 }
 
 let quotaRequestInFlight = false;
@@ -3607,6 +3730,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             return None
 
+    def _control_allowed(self):
+        """Whether this request may drive the sign-in subprocess."""
+        if not is_loopback_host(SERVE_HOST):
+            return False, "Sign-in is only available when the dashboard is bound to localhost."
+        supplied = self.headers.get(CONTROL_TOKEN_HEADER) or ""
+        # Constant-time: the token is a secret and this endpoint is unauthenticated
+        # otherwise, so don't leak its prefix through comparison timing.
+        if not secrets.compare_digest(supplied, CONTROL_TOKEN):
+            return False, "Reload the dashboard and try again."
+        return True, ""
+
     def _load_settings(self):
         """Re-read settings (and re-apply price overrides) for this request.
 
@@ -3628,6 +3762,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # `window.APP_CONFIG = __APP_CONFIG_JSON__;` placeholder in the head.
             config = json.dumps({
                 "version": VERSION,
+                # Same-origin-only secret for the sign-in route; see CONTROL_TOKEN.
+                "controlToken": CONTROL_TOKEN,
+                # A sign-in button is pointless without the CLI that performs it
+                # (the Docker image has no `claude` binary), and unsafe off
+                # loopback — decide once, here, rather than in the browser.
+                "canSignIn": quota.sign_in_available() and is_loopback_host(SERVE_HOST),
                 # Effective prices, so the browser's calcCost matches the CLI's
                 # even when the user has overridden a rate.
                 "pricing": pricing.pricing_by_source(),
@@ -3660,6 +3800,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/settings":
             self._send_json(200, settings_payload(active_settings))
+
+        elif path == "/api/signin":
+            allowed, reason = self._control_allowed()
+            if not allowed:
+                self._send_json(403, {"error": reason})
+                return
+            self._send_json(200, quota.sign_in_state())
 
         elif path in ASSET_ROUTES:
             filename, content_type = ASSET_ROUTES[path]
@@ -3701,6 +3848,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             settings.apply(saved)
             self._send_json(200, settings_payload(saved))
 
+        elif path == "/api/signin":
+            allowed, reason = self._control_allowed()
+            if not allowed:
+                self._send_json(403, {"error": reason})
+                return
+            if not quota.sign_in_available():
+                self._send_json(501, {"error": quota.SIGN_IN_UNAVAILABLE_MESSAGE})
+                return
+            # 202: the browser half of the flow outlives this response.
+            self._send_json(202, quota.start_sign_in())
+
         elif path == "/api/rescan":
             # Incremental scan: ingest new/changed JSONL without touching
             # existing rows. The DB is append-only and the only durable store
@@ -3732,8 +3890,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def serve(host=None, port=None):
     settings.apply()
+    global SERVE_HOST
     host = host or os.environ.get("HOST", "localhost")
     port = port or int(os.environ.get("PORT", "8080"))
+    # Remembered so the sign-in gate can refuse a non-loopback bind.
+    SERVE_HOST = host
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     print(f"Dashboard running at http://{host}:{port}")
     print("Press Ctrl+C to stop.")

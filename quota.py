@@ -4,7 +4,9 @@ import glob
 import json
 import os
 import shutil
+import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -34,10 +36,15 @@ _CLAUDE_API_MESSAGE = None
 CLAUDE_API_CACHE_PATH = Path.home() / ".claude" / "usage-quota-cache.json"
 CLAUDE_API_DISK_MAX_AGE_SECONDS = 24 * 60 * 60
 
-NO_CREDENTIAL_MESSAGE = "No Claude Code sign-in found — run `claude auth login`"
-AUTH_FAILED_MESSAGE = "Claude Code sign-in expired — run `claude auth login`, then retry"
+# State only — no remedy. The dashboard can start a sign-in itself where the
+# Claude Code CLI is installed, and printing "run `claude auth login`" next to a
+# button that does exactly that reads as a contradiction. The surface that knows
+# which remedy applies is the one that offers it.
+NO_CREDENTIAL_MESSAGE = "No Claude Code sign-in found"
+AUTH_FAILED_MESSAGE = "Claude Code sign-in expired"
 RATE_LIMITED_MESSAGE = "Claude's usage endpoint is busy — showing the last reading"
 NETWORK_MESSAGE = "Could not reach Claude's usage endpoint"
+CREDENTIAL_STALE_MESSAGE = "Could not confirm the Claude Code sign-in"
 NO_READING_YET_MESSAGE = "Waiting for Claude's first usage reading"
 
 
@@ -153,9 +160,36 @@ def _claude_credentials():
     if token:
         return token, None
 
-    # Claude Code stores this credential in the macOS Keychain on supported
-    # installs. Keep the subprocess invocation argument-based; never invoke a
-    # shell and never include the secret in an exception or log message.
+    # Both stores are read and the *freshest* credential wins.  Installs exist
+    # where one of them lags the other (the Keychain item is not always rewritten
+    # when the CLI renews in-process), and preferring whichever store has the
+    # later expiry costs one file read and avoids reporting a signed-out user
+    # who is signed in perfectly well somewhere else.
+    candidates = []
+    for reader in (_keychain_blob, _credentials_file_blob):
+        try:
+            raw = reader()
+        except Exception:  # a broken store must not take the panel down
+            continue
+        if not raw:
+            continue
+        found, expires_at = _oauth_blob(raw)
+        if found:
+            candidates.append((found, expires_at))
+
+    if not candidates:
+        return "", None
+    # `None` expiry means "no expiry recorded" — treat it as the best case, the
+    # same assumption the env-var branch above makes.
+    return max(candidates, key=lambda pair: float("inf") if pair[1] is None else pair[1])
+
+
+def _keychain_blob():
+    """Raw credential blob from the macOS Keychain, or ``""``.
+
+    Keep the subprocess invocation argument-based; never invoke a shell and
+    never include the secret in an exception or log message.
+    """
     try:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
@@ -164,23 +198,32 @@ def _claude_credentials():
             timeout=2,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        result = None
-    if result and result.returncode == 0 and result.stdout:
-        token, expires_at = _oauth_blob(result.stdout)
-        if token:
-            return token, expires_at
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout or ""
 
-    credentials_path = Path.home() / ".claude" / ".credentials.json"
+
+def _credentials_file_blob():
+    """Raw credential blob from ``~/.claude/.credentials.json``, or ``""``."""
     try:
-        with credentials_path.open(encoding="utf-8") as stream:
-            return _oauth_blob(stream.read())
-    except OSError:
-        return "", None
+        with (Path.home() / ".claude" / ".credentials.json").open(encoding="utf-8") as stream:
+            return stream.read()
+    except (OSError, UnicodeDecodeError):
+        return ""
 
 
 _LAST_CLI_REFRESH_AT = 0.0
 CLI_REFRESH_MIN_INTERVAL = 60
+
+# A locally-expired token is not proof of a signed-out user (a stale `expiresAt`
+# and a skewed clock both look identical from here), so the verdict comes from
+# `/api/oauth/profile` instead.  The answer is cached per token so a dashboard
+# polling every few seconds does not re-probe on every request.
+CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+PROBE_CACHE_SECONDS = 60
+_PROBE_CACHE = {}
 
 
 def _is_expired(expires_at):
@@ -198,14 +241,20 @@ def _claude_cli():
 
 
 def _refresh_credentials_via_cli():
-    """Ask Claude Code to renew its own OAuth credential, then re-read it.
+    """Nudge Claude Code to renew its own OAuth credential, then re-read it.
 
-    `claude auth status` is read-only from the user's point of view, but it
-    makes the CLI notice an expired access token and exchange its refresh token
-    — writing the renewed credential back to the Keychain itself.  Letting the
-    first-party tool own that exchange is why this file never touches the
-    refresh token: those rotate single-use, and spending one here would log the
-    user out of their editor.
+    `claude auth status` is read-only from the user's point of view and can make
+    the CLI notice an expired access token and exchange its refresh token —
+    writing the renewed credential back itself.  Letting the first-party tool
+    own that exchange is why this file never touches the refresh token: those
+    rotate single-use, and spending one here would log the user out of their
+    editor.
+
+    Success is judged by **the stored credential actually moving forward**, not
+    by what the CLI printed.  `auth status` answers ``{"loggedIn": true}`` from
+    cached state on installs where it performs no exchange at all, so trusting
+    that field reported a successful refresh that never happened — and the
+    caller then declared a signed-in user signed out.
     """
     global _LAST_CLI_REFRESH_AT
     now = time.monotonic()
@@ -217,18 +266,196 @@ def _refresh_credentials_via_cli():
     if not cli:
         return False
     try:
-        result = subprocess.run(
+        subprocess.run(
             [cli, "auth", "status"],
             capture_output=True, text=True, timeout=20, check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if result.returncode != 0:
-        return False
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False  # a CLI that will not run is not a signed-out user
+
+    # The exit code and stdout are deliberately ignored: only the credential
+    # store is authoritative about whether a renewal happened.
     try:
-        return bool(json.loads(result.stdout or "{}").get("loggedIn"))
-    except json.JSONDecodeError:
+        _, expires_at = _claude_credentials()
+    except Exception:
         return False
+    return not _is_expired(expires_at)
+
+
+def _token_is_live(token):
+    """Ask the API whether ``token`` is still accepted.
+
+    Returns ``True`` (accepted), ``False`` (rejected — genuinely signed out) or
+    ``None`` (**unknown** — the probe itself failed).  The three-way answer is
+    the point: a timeout or a 500 must not be reported to the user as an expired
+    sign-in, and the usage endpoint cannot be used for this because it answers
+    429 rather than 401 for a bad token.  `/api/oauth/profile` returns the
+    honest 401.
+    """
+    cached = _PROBE_CACHE.get(token)
+    if cached and time.monotonic() - cached[0] < PROBE_CACHE_SECONDS:
+        return cached[1]
+
+    request = urllib.request.Request(
+        CLAUDE_PROFILE_URL,
+        headers={
+            "Accept": "application/json",
+            "Authorization": "Bearer " + token,
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code-usage-dashboard",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5):
+            verdict = True
+    except urllib.error.HTTPError as error:
+        # Only an explicit rejection counts as "signed out".  A 429/5xx says
+        # nothing about the credential.
+        verdict = False if error.code in (401, 403) else None
+    except Exception:
+        verdict = None
+
+    # Never cache "unknown" — the next poll should be free to try again.
+    if verdict is not None:
+        _PROBE_CACHE.clear()  # one credential at a time; keeps this bounded
+        _PROBE_CACHE[token] = (time.monotonic(), verdict)
+    return verdict
+
+
+# ── Interactive sign-in ────────────────────────────────────────────────────
+# `claude auth login` drives the whole OAuth flow itself: it opens the browser,
+# holds the PKCE verifier, and writes the renewed credential to its own store.
+# Running it as a subprocess is what lets the dashboard offer a sign-in button
+# without this file ever handling an authorization code or a refresh token.
+SIGN_IN_TIMEOUT_SECONDS = 300
+_SIGN_IN_LOCK = threading.Lock()
+_SIGN_IN_STATE = {"status": "idle", "message": "", "url": "", "started_at": 0.0}
+_AUTHORIZE_URL = re.compile(r"https://\S*/oauth/authorize\S*")
+
+SIGN_IN_UNAVAILABLE_MESSAGE = "Claude Code CLI not found on this machine"
+SIGN_IN_RUNNING_MESSAGE = "Approve the sign-in in the browser tab that just opened."
+SIGN_IN_OK_MESSAGE = "Signed in"
+SIGN_IN_FAILED_MESSAGE = "The browser flow was closed before it finished."
+SIGN_IN_TIMEOUT_MESSAGE = "The sign-in took too long and was cancelled."
+
+
+def sign_in_available():
+    """True when a sign-in can actually be started on this machine."""
+    return bool(_claude_cli())
+
+
+def sign_in_state():
+    """Snapshot of the current/last sign-in attempt, safe to serialize."""
+    with _SIGN_IN_LOCK:
+        state = dict(_SIGN_IN_STATE)
+    state["available"] = sign_in_available()
+    return state
+
+
+def _set_sign_in(status, message, url=None):
+    with _SIGN_IN_LOCK:
+        _SIGN_IN_STATE["status"] = status
+        _SIGN_IN_STATE["message"] = message
+        if url is not None:
+            _SIGN_IN_STATE["url"] = url
+
+
+def start_sign_in():
+    """Begin a sign-in in the background; returns the state to report back.
+
+    Returns immediately — the browser half of the flow can take minutes, and a
+    request thread parked on it would look like a hung dashboard.  The caller
+    polls `sign_in_state()`.
+    """
+    if not sign_in_available():
+        _set_sign_in("unavailable", SIGN_IN_UNAVAILABLE_MESSAGE, "")
+        return sign_in_state()
+
+    with _SIGN_IN_LOCK:
+        if _SIGN_IN_STATE["status"] == "running":
+            return dict(_SIGN_IN_STATE, available=True)  # single-flight
+        _SIGN_IN_STATE.update({
+            "status": "running",
+            "message": SIGN_IN_RUNNING_MESSAGE,
+            "url": "",
+            "started_at": time.time(),
+        })
+
+    threading.Thread(target=_run_sign_in, daemon=True).start()
+    return sign_in_state()
+
+
+def _run_sign_in():
+    """Drive `claude auth login` to completion, then judge it by the store.
+
+    The exit code is corroborating evidence only.  As with
+    `_refresh_credentials_via_cli`, the credential itself is the authority on
+    whether a sign-in happened — a CLI can exit 0 having changed nothing.
+    """
+    cli = _claude_cli()
+    try:
+        process = subprocess.Popen(
+            [cli, "auth", "login"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        _set_sign_in("failed", f"Could not start Claude Code: {exc}", "")
+        return
+
+    # A watchdog rather than `communicate(timeout=...)`: stdout is read live so
+    # the authorize URL reaches the page while the flow is still open.
+    timer = threading.Timer(SIGN_IN_TIMEOUT_SECONDS, process.kill)
+    timer.daemon = True
+    timer.start()
+    try:
+        for line in process.stdout or ():
+            match = _AUTHORIZE_URL.search(line)
+            if match:
+                _set_sign_in("running", SIGN_IN_RUNNING_MESSAGE, match.group(0))
+        process.wait()
+    except Exception:
+        process.kill()
+    finally:
+        timer.cancel()
+        try:
+            if process.stdout:
+                process.stdout.close()
+        except OSError:
+            pass
+
+    _finish_sign_in(process.returncode)
+
+
+def _finish_sign_in(returncode):
+    """Report the outcome, and clear the caches that would hide a success."""
+    try:
+        token, expires_at = _claude_credentials()
+    except Exception:
+        token, expires_at = "", None
+
+    if token and not _is_expired(expires_at):
+        # Without this the panel would keep serving the auth back-off for
+        # another five minutes after a sign-in that plainly worked.
+        reset_auth_backoff()
+        _set_sign_in("ok", SIGN_IN_OK_MESSAGE, "")
+        return
+
+    if returncode is not None and returncode < 0:
+        _set_sign_in("failed", SIGN_IN_TIMEOUT_MESSAGE, "")
+    else:
+        _set_sign_in("failed", SIGN_IN_FAILED_MESSAGE, "")
+
+
+def reset_auth_backoff():
+    """Forget cached auth failures so the next poll re-checks for real."""
+    global _CLAUDE_API_RETRY_AFTER, _CLAUDE_API_MESSAGE, _LAST_CLI_REFRESH_AT
+    _PROBE_CACHE.clear()
+    _CLAUDE_API_RETRY_AFTER = 0.0
+    _CLAUDE_API_MESSAGE = None
+    _LAST_CLI_REFRESH_AT = 0.0
 
 
 def _load_disk_snapshot():
@@ -268,6 +495,16 @@ def _unexpired_windows(windows):
     ]
 
 
+def _is_sign_in_message(message):
+    """True only for messages that a sign-in would actually fix.
+
+    `CREDENTIAL_STALE_MESSAGE` is deliberately excluded: it means the check was
+    inconclusive, and offering a sign-in button there trains users to re-auth
+    over what is usually a network blip.
+    """
+    return message in (NO_CREDENTIAL_MESSAGE, AUTH_FAILED_MESSAGE)
+
+
 def _stale_claude_snapshot(message):
     """Reuse the last good live reading when a refresh fails.
 
@@ -293,7 +530,7 @@ def _stale_claude_snapshot(message):
     # A stale reading does not mean the credential is fine: when the refresh
     # failed *because* the user is signed out, the panel still has to offer the
     # sign-in action instead of just older percentages.
-    stale["needs_sign_in"] = message in (NO_CREDENTIAL_MESSAGE, AUTH_FAILED_MESSAGE)
+    stale["needs_sign_in"] = _is_sign_in_message(message)
     return stale
 
 
@@ -323,15 +560,31 @@ def _claude_api_snapshot(force_refresh=False):
     if not force_refresh and now < _CLAUDE_API_RETRY_AFTER:
         return _stale_claude_snapshot(_CLAUDE_API_MESSAGE)
 
-    token, expires_at = _claude_credentials()
+    try:
+        token, expires_at = _claude_credentials()
+    except Exception:
+        # An unreadable credential store is a local fault, not a sign-out.
+        return _back_off("network", CREDENTIAL_STALE_MESSAGE)
+
     if _is_expired(expires_at) and _refresh_credentials_via_cli():
         token, expires_at = _claude_credentials()
     if not token:
         return _back_off("auth", NO_CREDENTIAL_MESSAGE)
+
     if _is_expired(expires_at):
-        # See `_claude_credentials`: the usage endpoint would answer 429 here
-        # and we'd report "throttled" for a user who is actually signed out.
-        return _back_off("auth", AUTH_FAILED_MESSAGE)
+        # A stored expiry in the past is a suspicion, not a verdict.  The CLI
+        # and the desktop app renew in-process and do not always write the new
+        # access token back to the store we just read, so this branch fires
+        # routinely for users who are signed in — hence the probe.  See
+        # `_token_is_live` for why the usage endpoint cannot answer this.
+        verdict = _token_is_live(token)
+        if verdict is False:
+            return _back_off("auth", AUTH_FAILED_MESSAGE)
+        if verdict is None:
+            # Could not tell.  Say so and keep the last reading rather than
+            # accusing a working sign-in of having expired.
+            return _back_off("network", CREDENTIAL_STALE_MESSAGE)
+        # Accepted: the stored expiry was stale.  Fall through and use it.
 
     request = urllib.request.Request(
         "https://api.anthropic.com/api/oauth/usage",
@@ -572,5 +825,5 @@ def get_quota_snapshot(source, claude_dirs=None, codex_dir=None, force_refresh=F
             # or rejected credential is something the user can fix by signing
             # in, so only that state offers the button.
             snapshot["message"] = _CLAUDE_API_MESSAGE or NO_READING_YET_MESSAGE
-            snapshot["needs_sign_in"] = _CLAUDE_API_MESSAGE in (NO_CREDENTIAL_MESSAGE, AUTH_FAILED_MESSAGE)
+            snapshot["needs_sign_in"] = _is_sign_in_message(_CLAUDE_API_MESSAGE)
     return snapshot
