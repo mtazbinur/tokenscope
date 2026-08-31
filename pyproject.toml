@@ -1,0 +1,31 @@
+# Packaging metadata so the tool can be installed with `uv tool install` / `pipx`
+# without a clone (#144). This is packaging only — the tool stays stdlib-only at
+# runtime ([project.dependencies] is empty) and the clone + `python cli.py` path
+# is unaffected.
+#
+# The version is read dynamically from scanner.VERSION so it stays a single
+# source of truth with the CHANGELOG heading — do NOT hardcode it here.
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenscope"
+dynamic = ["version"]
+description = "Token, cost, and session dashboard for Claude Code and Codex"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Paweł Huryn" }]
+keywords = ["claude", "claude-code", "usage", "tokens", "cost", "dashboard"]
+dependencies = []
+
+[project.scripts]
+tokenscope = "cli:main"
+
+# Flat top-level modules, no package directory — mirror the repo layout.
+[tool.setuptools]
+py-modules = ["cli", "scanner", "dashboard", "pricing", "quota", "settings"]
+
+[tool.setuptools.dynamic]
+version = { attr = "scanner.VERSION" }

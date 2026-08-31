@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / AST files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+server.log
+logs/
+*.log
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python packaging build artifacts (uv build / pip / setuptools) — see pyproject.toml
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Testing & coverage
+.coverage
+.pytest_cache/
+htmlcov/
+
+# Operating System & IDEs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local / temporary artifacts
+.pr-candidates.md
+/tmp/

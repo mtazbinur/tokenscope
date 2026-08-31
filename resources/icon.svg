@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="TokenScope">
+  <!-- TokenScope mark, monochrome silhouette: a scope ring sighted on a rising
+       token/cost bar chart. Same geometry as the full-colour favicon.svg with
+       the violet ground removed.
+
+       This file is consumed as a CSS mask (see `header .header-icon` in
+       dashboard.py), which keys off *alpha*, not colour — so the shapes are
+       opaque white on transparent and the sidebar tints them with
+       `background-color`. Adding a background here would paint a solid block. -->
+  <g fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round">
+    <circle cx="16" cy="15" r="8.6"/>
+  </g>
+  <g fill="#fff">
+    <rect x="11.1" y="16.2" width="2.2" height="3.4" rx="1.1"/>
+    <rect x="14.9" y="13.4" width="2.2" height="6.2" rx="1.1"/>
+    <rect x="18.7" y="10.6" width="2.2" height="9.0" rx="1.1"/>
+  </g>
+</svg>
