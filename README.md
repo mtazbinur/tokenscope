@@ -11,7 +11,7 @@ models, sessions, projects, subagents — no matter which plan you are on. Token
 reads those logs and turns them into charts, tables, and cost estimates. Each provider
 keeps its own tab, so models and pricing are never mixed.
 
-Everything runs locally. Your transcripts never leave your machine.
+Analysis and storage run locally. TokenScope never uploads your transcripts.
 
 ![The TokenScope dashboard](docs/dashboard.png)
 
@@ -27,6 +27,7 @@ Everything runs locally. Your transcripts never leave your machine.
 - [Cost estimates](#cost-estimates)
 - [How it works](#how-it-works)
 - [Project layout](#project-layout)
+- [Contributing and security](#contributing-and-security)
 
 ---
 
@@ -51,17 +52,23 @@ project × branch, session, and subagent dispatch. Every table exports to CSV, e
 section collapses, and the date range and model filter live in the URL so a view can
 be bookmarked.
 
-The sidebar also shows **usage remaining** per plan-limit window, read from the
-provider's own local usage signal.
+The sidebar also shows **usage remaining** per plan-limit window. Codex limits are
+read from local rollout data. For Claude, TokenScope uses Claude Code's local sign-in
+to request the current limits from Anthropic's OAuth usage endpoint; transcript
+contents are not included in that request.
+
+The dashboard loads Chart.js from jsDelivr. Apart from that browser asset and the
+Claude usage-limit request above, transcript scanning and reporting stay on your
+machine.
 
 ---
 
 ## Requirements
 
-- Python 3.8+
-- No third-party packages. Standard library only (`sqlite3`, `http.server`, `json`, `pathlib`).
-
-> Anyone running Claude Code already has Python installed.
+- Python 3.8+ when running directly from source
+- No third-party Python packages. Standard library only (`sqlite3`, `http.server`, `json`, `pathlib`).
+- Internet access for the dashboard's Chart.js asset and live Claude usage limits
+- Docker and Bash only if you use the Docker option
 
 ---
 
@@ -72,12 +79,16 @@ No `pip install`, no virtual environment, no build step.
 macOS / Linux:
 
 ```bash
+git clone https://github.com/mtazbinur/tokenscope.git
+cd tokenscope
 python3 cli.py dashboard
 ```
 
 Windows:
 
 ```bash
+git clone https://github.com/mtazbinur/tokenscope.git
+cd tokenscope
 python cli.py dashboard
 ```
 
@@ -86,10 +97,14 @@ That scans your logs and opens <http://localhost:8080>.
 ### Install as a command
 
 ```bash
-uv tool install git+https://github.com/phuryn/claude-usage
+uv tool install git+https://github.com/mtazbinur/tokenscope.git
 ```
 
-Then `tokenscope dashboard` from anywhere. `pipx install` works the same way.
+Then run `tokenscope dashboard` from anywhere. With `pipx`, use:
+
+```bash
+pipx install git+https://github.com/mtazbinur/tokenscope.git
+```
 
 ### Docker
 
@@ -104,6 +119,10 @@ the container with:
 - `~/.codex` mounted **read-only when present**
 - a named volume (`tokenscope-data`) for the SQLite database and your settings file,
   persisted across restarts and isolated from your home directory
+
+The dashboard has no authentication. The Docker script publishes port `9898` on all
+host interfaces, so other devices may be able to reach it through your machine's
+network address. Run it only on a trusted network or behind an appropriate firewall.
 
 ---
 
@@ -267,8 +286,16 @@ local log files every 30 minutes.
 | [Dockerfile](Dockerfile) | Container image |
 | [scripts/run-docker.sh](scripts/run-docker.sh) | Build and run with read-only log mounts |
 
-Contributing and release conventions live in [AGENTS.md](AGENTS.md). Version history is
-in [CHANGELOG.md](CHANGELOG.md).
+---
+
+## Contributing and security
+
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, testing,
+project conventions, and the pull request checklist. Please report vulnerabilities
+privately using [SECURITY.md](SECURITY.md), not through a public issue.
+
+Detailed coding-agent and maintainer conventions remain in [AGENTS.md](AGENTS.md).
+Version history is in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

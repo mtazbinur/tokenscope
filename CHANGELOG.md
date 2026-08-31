@@ -1,13 +1,12 @@
 # Changelog
 
-All notable changes to TokenScope, newest first. Versions follow [SemVer](https://semver.org/);
-this file is the canonical version reference and tags are created from it (see
-[AGENTS.md](AGENTS.md#versioning-and-releases)).
+All notable changes to TokenScope, newest first. Versions follow [SemVer](https://semver.org/),
+and this file is the canonical version reference.
 
 TokenScope's history starts at v1.0.0 — the entries of the project it grew out of
 are not carried over here.
 
-## v1.1.0 — TBD
+## v1.1.0 — 2026-08-31
 
 ### Settings
 
@@ -64,6 +63,7 @@ are not carried over here.
 
 - Replaced the application mark with a purpose-drawn TokenScope logo — a scope ring sighted on a rising bar chart — as a full-colour `resources/favicon.svg` (now served as the browser tab icon) and a matching monochrome `resources/icon.svg` for the sidebar's CSS mask. The old 160KB raster-traced mark is gone.
 - Rewrote the README around this project: current feature set, a Settings section, and fresh screenshots taken from this build. The inherited screenshots were of a different product and have been deleted.
+- Added public contribution and security-reporting guides, corrected the installation instructions, and documented the dashboard's network behavior.
 
 ## v1.0.0 — 2026-08-31
 
