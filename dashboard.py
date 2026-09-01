@@ -1078,6 +1078,17 @@ const QUOTA_SOURCE_LABELS = {
   local_usage: 'Measured',
 };
 
+// The remedy depends on what this machine can actually do: start the flow here,
+// or say where to start it. Keyed on `needs_sign_in` alone so every state that
+// a sign-in would fix offers one.
+function signInAction(quota) {
+  if (!quota || !quota.needs_sign_in) return '';
+  return APP_CONFIG.canSignIn
+    ? '<button class="quota-signin" type="button" onclick="startSignIn()">Sign in to Claude Code</button>'
+    : '<span class="quota-authhint">Run <code>claude auth login</code> in your terminal, then check again.</span>'
+      + '<button class="quota-signin" type="button" onclick="refreshQuota(true)">Check again</button>';
+}
+
 function renderQuota(quota) {
   const rows = document.getElementById('quota-rows');
   const updated = document.getElementById('quota-updated');
@@ -1089,19 +1100,9 @@ function renderQuota(quota) {
     // Only a credential problem is user-fixable, so only that state gets an
     // action. Where the Claude Code CLI is present and we are on loopback, the
     // button runs the real sign-in; otherwise it can only re-poll, and says so.
-    // The remedy depends on what this machine can actually do: start the flow
-    // here, or tell the user where to start it. An empty state is an invitation
-    // to act, so it always ends in one.
-    let action = '';
-    if (quota && quota.needs_sign_in) {
-      action = APP_CONFIG.canSignIn
-        ? '<button class="quota-signin" type="button" onclick="startSignIn()">Sign in to Claude Code</button>'
-        : '<span class="quota-authhint">Run <code>claude auth login</code> in your terminal, then check again.</span>'
-          + '<button class="quota-signin" type="button" onclick="refreshQuota(true)">Check again</button>';
-    }
     rows.innerHTML = '<div class="quota-empty"><strong>Usage unavailable</strong>'
       + esc((quota && quota.message) || 'No recent local quota signal.')
-      + action + '</div>';
+      + signInAction(quota) + '</div>';
     if (updated) updated.textContent = 'Unavailable';
     return;
   }
@@ -1113,8 +1114,12 @@ function renderQuota(quota) {
       + '<span class="quota-reset">' + esc(quotaResetText(window.reset_at)) + '</span></div>';
   }).join('');
   // A stale reading still shows its percentages; the note says why they are old.
+  // The remedy belongs here too: an expired sign-in is just as fixable when the
+  // panel still has old numbers to display as when it has none, and hanging the
+  // button off an empty window list left the one state that always has windows
+  // — a stale live reading — with nothing to press.
   if (quota.source === 'live_api_stale' && quota.message) {
-    html += '<div class="quota-note">' + esc(quota.message) + '</div>';
+    html += '<div class="quota-note">' + esc(quota.message) + signInAction(quota) + '</div>';
   }
   rows.innerHTML = html;
   if (updated) {

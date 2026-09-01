@@ -752,6 +752,28 @@ class TestHTMLTemplate(unittest.TestCase):
         self.assertNotIn("api.github.com/repos/phuryn/claude-usage/releases/latest", HTML_TEMPLATE)
 
 
+class TestSignInAffordance(unittest.TestCase):
+    """The sign-in button must not be tied to an empty window list.
+
+    Regression: `needs_sign_in` arrives with a *stale* live reading, which still
+    has windows, so the panel rendered the rows plus an "expired" footnote and
+    no way to act on it. The action is keyed on `needs_sign_in` alone.
+    """
+
+    def test_the_stale_reading_branch_offers_the_action(self):
+        stale_note = [line for line in HTML_TEMPLATE.splitlines() if "quota-note" in line and "html +=" in line]
+        self.assertTrue(stale_note, "stale-reading note line not found in the template")
+        self.assertIn("signInAction(quota)", stale_note[0])
+
+    def test_the_empty_branch_offers_the_action(self):
+        empty = [line for line in HTML_TEMPLATE.splitlines() if "quota-empty" in line and "Usage unavailable" in line]
+        self.assertTrue(empty, "empty-state line not found in the template")
+        self.assertIn("signInAction(quota)", HTML_TEMPLATE)
+
+    def test_the_action_is_gated_on_needs_sign_in(self):
+        self.assertIn("if (!quota || !quota.needs_sign_in) return '';", HTML_TEMPLATE)
+
+
 class TestPricingParity(unittest.TestCase):
     """The browser receives the Python pricing structure, not a copy."""
 
