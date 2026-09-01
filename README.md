@@ -65,7 +65,8 @@ machine.
 
 ## Requirements
 
-- Python 3.8+ when running directly from source
+- [`uv`](https://docs.astral.sh/uv/) or [`pipx`](https://pipx.pypa.io/) for the recommended installation
+- Python 3.8+ when installing with `pipx` or running directly from source
 - No third-party Python packages. Standard library only (`sqlite3`, `http.server`, `json`, `pathlib`).
 - Internet access for the dashboard's Chart.js asset and live Claude usage limits
 - Docker and Bash only if you use the Docker option
@@ -74,7 +75,31 @@ machine.
 
 ## Quick start
 
-No `pip install`, no virtual environment, no build step.
+Install TokenScope as an isolated command with `uv`:
+
+```bash
+uv tool install git+https://github.com/mtazbinur/tokenscope.git
+```
+
+Or with `pipx`:
+
+```bash
+pipx install git+https://github.com/mtazbinur/tokenscope.git
+```
+
+Then launch the dashboard from anywhere:
+
+```bash
+tokenscope dashboard
+```
+
+That scans your local Claude Code and Codex logs and opens <http://localhost:8080>.
+Both installers keep TokenScope in an isolated environment; the application itself
+has no third-party runtime dependencies.
+
+### Run from source
+
+If you prefer not to install the command, clone the repository and run it directly.
 
 macOS / Linux:
 
@@ -90,20 +115,6 @@ Windows:
 git clone https://github.com/mtazbinur/tokenscope.git
 cd tokenscope
 python cli.py dashboard
-```
-
-That scans your logs and opens <http://localhost:8080>.
-
-### Install as a command
-
-```bash
-uv tool install git+https://github.com/mtazbinur/tokenscope.git
-```
-
-Then run `tokenscope dashboard` from anywhere. With `pipx`, use:
-
-```bash
-pipx install git+https://github.com/mtazbinur/tokenscope.git
 ```
 
 ### Docker
@@ -128,34 +139,35 @@ network address. Run it only on a trusted network or behind an appropriate firew
 
 ## Commands
 
-> On macOS/Linux use `python3` instead of `python`.
+The examples below assume installation with `uv` or `pipx`. When running from source,
+replace `tokenscope` with `python3 cli.py` on macOS/Linux or `python cli.py` on Windows.
 
 ```bash
 # Scan Claude Code and Codex logs into ~/.claude/usage.db
-python cli.py scan
+tokenscope scan
 
 # Scan one provider explicitly
-python cli.py scan --source claude_code
-python cli.py scan --source codex
+tokenscope scan --source claude_code
+tokenscope scan --source codex
 
 # Scan from custom locations
-python cli.py scan --projects-dir /path/to/transcripts
-python cli.py scan --source codex --codex-dir /path/to/codex/sessions
+tokenscope scan --projects-dir /path/to/transcripts
+tokenscope scan --source codex --codex-dir /path/to/codex/sessions
 
 # Terminal summaries
-python cli.py today          # today, by model
-python cli.py week           # last 7 days, per-day + by-model
-python cli.py stats          # all-time
+tokenscope today          # today, by model
+tokenscope week           # last 7 days, per-day + by-model
+tokenscope stats          # all-time
 
 # Dashboard
-python cli.py dashboard
-python cli.py dashboard --host 0.0.0.0 --port 9000
-python cli.py dashboard --no-browser
+tokenscope dashboard
+tokenscope dashboard --host 0.0.0.0 --port 9000
+tokenscope dashboard --no-browser
 
 # Environment variables work too
-HOST=0.0.0.0 PORT=9000 python cli.py dashboard
+HOST=0.0.0.0 PORT=9000 tokenscope dashboard
 
-python cli.py --version
+tokenscope --version
 ```
 
 The scanner is incremental: it records each file's path, mtime, and line count, so
