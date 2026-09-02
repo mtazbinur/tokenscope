@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
@@ -15,7 +16,8 @@ from datetime import datetime, timezone
 import pricing
 import scanner
 import settings
-from scanner import VERSION, SOURCE_CLAUDE, SOURCE_CODEX, init_db
+from scanner import VERSION, SOURCE_CLAUDE, SOURCE_CODEX, SOURCE_ANTIGRAVITY, init_db
+from sources import SOURCE_ORDER
 from pricing import BUILTIN_PRICING_BY_SOURCE, calc_cost
 import quota
 from quota import get_quota_snapshot
@@ -32,6 +34,58 @@ CONTROL_TOKEN_HEADER = "X-Tokenscope-Control"
 
 # Set by serve(); the default matches serve()'s own default bind.
 SERVE_HOST = "localhost"
+# Optional roots supplied by `tokenscope dashboard`; kept separate from the
+# scanner defaults so manual rescans use the same invocation configuration.
+SCAN_ANTIGRAVITY_DIR = None
+
+
+class ScanCoordinator:
+    """Run at most one usage scan at a time within this dashboard process.
+
+    The HTTP server is threaded and the startup scan runs in its own thread, so
+    a browser with multiple tabs can otherwise start overlapping SQLite writers
+    and duplicate filesystem walks. Callers that arrive during a scan wait for
+    that scan and reuse its result instead of immediately running another one.
+    """
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._active = False
+        self._generation = 0
+        self._result = None
+        self._error = None
+
+    def run(self, scan):
+        with self._condition:
+            if self._active:
+                generation = self._generation
+                while self._active and self._generation == generation:
+                    self._condition.wait()
+                if self._error is not None:
+                    raise RuntimeError("The in-progress usage scan failed.") from self._error
+                return self._result, True
+            self._active = True
+
+        try:
+            result = scan()
+        except Exception as exc:
+            with self._condition:
+                self._error = exc
+                self._active = False
+                self._generation += 1
+                self._condition.notify_all()
+            raise
+
+        with self._condition:
+            self._result = result
+            self._error = None
+            self._active = False
+            self._generation += 1
+            self._condition.notify_all()
+        return result, False
+
+
+SCAN_COORDINATOR = ScanCoordinator()
 
 
 def is_loopback_host(host):
@@ -56,19 +110,33 @@ SOURCE_CONFIG = {
         "label": "Claude Code",
         "short_label": "Claude",
         "pricing_basis": "Anthropic API pricing",
-        "capabilities": {"cache": True, "reasoning_tokens": False, "subagents": True},
+        "peak_hours": True,
+        "capabilities": {"cache": True, "reasoning_tokens": False, "subagents": True,
+                          "quota": True, "input_includes_cache": False},
     },
     SOURCE_CODEX: {
         "label": "Codex",
         "short_label": "Codex",
         "pricing_basis": "OpenAI API-equivalent estimate; not Codex plan billing",
-        "capabilities": {"cache": True, "reasoning_tokens": True, "subagents": False},
+        "peak_hours": False,
+        "capabilities": {"cache": True, "reasoning_tokens": True, "subagents": False,
+                          "quota": True, "input_includes_cache": True},
+    },
+    SOURCE_ANTIGRAVITY: {
+        "label": "Antigravity",
+        "short_label": "Antigravity",
+        "pricing_basis": "Underlying model API-equivalent estimate; not Antigravity plan billing",
+        "peak_hours": False,
+        "capabilities": {"cache": True, "reasoning_tokens": True, "subagents": False,
+                          "quota": True, "input_includes_cache": False},
     },
 }
 
 
 def resolve_quota(source, force_refresh=False):
     """Plan-limit windows for one provider, plus the title the panel shows."""
+    if not SOURCE_CONFIG.get(source, {}).get("capabilities", {}).get("quota", False):
+        return None
     snapshot = get_quota_snapshot(
         source,
         claude_dirs=scanner.DEFAULT_PROJECTS_DIRS,
@@ -118,6 +186,14 @@ def get_dashboard_data(db_path=DB_PATH, source=SOURCE_CLAUDE, quota_force_refres
         ORDER BY SUM(input_tokens + output_tokens) DESC
     """, (source,)).fetchall()
     all_models = [r["model"] for r in model_rows]
+    # Models with no exact or supported-prefix price stay visible everywhere,
+    # but the dashboard also gives the user a direct path to define their API-
+    # equivalent rates. ``unknown`` is our empty-model sentinel, not a model id
+    # a user can meaningfully price.
+    unpriced_models = [
+        model for model in all_models
+        if model != "unknown" and pricing.get_pricing(model, source=source) is None
+    ]
 
     # ── Daily per-model, ALL history (client filters by range) ────────────────
     daily_rows = conn.execute("""
@@ -336,8 +412,9 @@ def get_dashboard_data(db_path=DB_PATH, source=SOURCE_CLAUDE, quota_force_refres
         "label":           SOURCE_CONFIG[source]["label"],
         "capabilities":    SOURCE_CONFIG[source]["capabilities"],
         "provider":        SOURCE_CONFIG[source],
-        "available_sources": list(SOURCE_CONFIG),
+        "available_sources": list(SOURCE_ORDER),
         "all_models":      all_models,
+        "unpriced_models": unpriced_models,
         "daily_by_model":  daily_by_model,
         "hourly_by_model": hourly_by_model,
         "sessions_all":    sessions_all,
@@ -380,6 +457,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     --jump-h: 45px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
   html { scroll-behavior: smooth; }
   body {
     min-height: 100vh;
@@ -432,16 +510,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   header .header-icon {
     width: 24px; height: 24px; flex-shrink: 0; display: block;
     background-color: #a78bfa;
-    -webkit-mask: url("icon.svg") no-repeat center / contain;
-    mask: url("icon.svg") no-repeat center / contain;
+    -webkit-mask: var(--provider-logo, url("icon.svg")) no-repeat center / contain;
+    mask: var(--provider-logo, url("icon.svg")) no-repeat center / contain;
   }
+  body[data-source="claude_code"] { --provider-logo: url("claude-code-icon.svg"); }
   body[data-source="codex"] { --provider-accent: #63d7a0; --provider-accent-soft: rgba(99, 215, 160, 0.12); }
+  body[data-source="antigravity"] { --provider-accent: #f2a65a; --provider-accent-soft: rgba(242, 166, 90, 0.13); }
   /* Codex keeps its green accent everywhere else; the header mark stays the
      same violet as the Claude one so the two tabs read as one product. */
-  body[data-source="codex"] header .header-icon {
-    -webkit-mask-image: url("codex-icon.svg");
-    mask-image: url("codex-icon.svg");
-  }
+  body[data-source="codex"] { --provider-logo: url("codex-icon.svg"); }
+  body[data-source="antigravity"] { --provider-logo: url("antigravity-icon.svg"); }
   .quota-panel {
     margin: 0 1px 2px;
     padding: 12px 11px 10px;
@@ -466,7 +544,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .quota-refresh:disabled { opacity: 0.55; cursor: wait; }
   .quota-refresh.is-refreshing { animation: quota-spin 700ms linear infinite; }
   @keyframes quota-spin { to { transform: rotate(360deg); } }
-  .quota-rows { display: grid; gap: 1px; }
+  .quota-rows { display: grid; gap: 1px; max-height: 240px; overflow-y: auto; overscroll-behavior: contain; padding-right: 3px; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+  .quota-rows::-webkit-scrollbar { width: 6px; }
+  .quota-rows::-webkit-scrollbar-track { background: transparent; }
+  .quota-rows::-webkit-scrollbar-thumb { border-radius: 6px; background: var(--border-strong); }
+  .quota-rows::-webkit-scrollbar-thumb:hover { background: var(--muted); }
   .quota-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1px 8px; padding: 8px 0; border-top: 1px solid var(--border-soft); }
   .quota-row:first-child { border-top: 0; }
   .quota-window { color: var(--muted-strong); font-size: 11px; font-weight: 600; }
@@ -530,6 +612,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .custom-range-actions { display: flex; justify-content: flex-end; gap: 6px; }
 
   .container { max-width: 1560px; margin: 0 auto; padding: 30px 32px 52px; }
+  .unpriced-banner { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 13px; margin-bottom: 24px; padding: 13px 14px; border: 1px solid rgba(242, 166, 90, 0.28); border-radius: 8px; background: rgba(242, 166, 90, 0.07); animation: rise-in 260ms both; }
+  .unpriced-banner-icon { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 7px; background: rgba(242, 166, 90, 0.12); color: #f3b676; }
+  .unpriced-banner-icon svg { display: block; }
+  .unpriced-banner-copy { min-width: 0; }
+  .unpriced-banner-title { color: var(--text); font-size: 12.5px; font-weight: 650; }
+  .unpriced-banner-detail { display: block; margin-top: 2px; color: #c9aa8e; font-size: 11.5px; line-height: 1.45; overflow-wrap: anywhere; }
+  .unpriced-banner-models { display: flex; justify-content: flex-end; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .unpriced-model-btn { max-width: 260px; padding: 5px 8px; border: 1px solid rgba(242, 166, 90, 0.34); border-radius: 5px; background: rgba(242, 166, 90, 0.08); color: #f3c79d; cursor: pointer; font: inherit; font-size: 11px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: background 140ms ease, border-color 140ms ease, color 140ms ease; }
+  .unpriced-model-btn:hover { color: #ffe1c2; background: rgba(242, 166, 90, 0.14); border-color: rgba(242, 166, 90, 0.58); }
+  .unpriced-model-btn:focus-visible { outline: 2px solid #f2a65a; outline-offset: 2px; }
+  .unpriced-more { color: #c9aa8e; font-size: 11px; white-space: nowrap; }
   .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 0; margin-bottom: 32px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
   .stat-card { position: relative; min-height: 106px; padding: 17px 16px 15px; border-right: 1px solid var(--border); animation: rise-in 360ms both; }
   .stat-card:last-child { border-right: 0; }
@@ -680,11 +773,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   .price-group { margin-top: 16px; }
   .price-group + .price-group { padding-top: 16px; border-top: 1px solid var(--border-soft); }
-  .price-group-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 9px; }
+  .price-group-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 9px; cursor: pointer; user-select: none; }
+  .price-group-head:hover .price-group-title { color: var(--text); }
+  .price-group-head:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .price-group-title { font-size: 12px; font-weight: 650; }
+  .price-group-count { color: var(--muted); font-size: 11.5px; }
   .price-group-basis { color: var(--muted); font-size: 11.5px; }
   .price-filter { margin-left: auto; background: var(--raised); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font: inherit; font-size: 11.5px; padding: 5px 8px; min-width: 170px; }
   .price-filter::placeholder { color: var(--muted); }
+  /* Collapsed group: caret + title + count only, same fold pattern as the
+     dashboard's own collapsible cards (.card-caret rotation included). */
+  .price-group.collapsed .price-group-head { margin-bottom: 0; }
+  .price-group.collapsed .price-scroll,
+  .price-group.collapsed .add-model,
+  .price-group.collapsed .price-group-basis,
+  .price-group.collapsed .price-filter { display: none; }
 
   /* Capped height so two ~45-row tables don't turn the page into a scroll
      marathon — and so the sticky header has a container to stick inside. */
@@ -758,7 +861,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     header { position: static; width: auto; height: auto; display: grid; grid-template-columns: 1fr auto; gap: 12px; padding: 14px 18px; border-right: 0; border-bottom: 1px solid var(--border); }
     header .header-title { padding: 0; }
     .header-eyebrow { display: none; }
-    .source-tabs { grid-column: 1 / -1; grid-row: 2; grid-template-columns: 1fr 1fr; }
+    .source-tabs { grid-column: 1 / -1; grid-row: 2; grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .source-tab { text-align: center; }
     .quota-panel { grid-column: 1 / -1; }
     #rescan-btn { grid-column: 2; grid-row: 1; width: auto; margin: 0; padding: 7px 10px; }
@@ -770,6 +873,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .settings-bar { padding: 12px 18px; }
     .nav-settings { grid-column: 1 / -1; margin-top: 0; }
     footer { padding: 18px; }
+    .unpriced-banner { grid-template-columns: auto minmax(0, 1fr); }
+    .unpriced-banner-models { grid-column: 1 / -1; justify-content: flex-start; }
   }
   @media (max-width: 640px) {
     .stats-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -791,10 +896,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <span class="header-icon" role="img" aria-label="TokenScope"></span>
     <div class="header-copy"><span class="header-eyebrow">TOKENSCOPE</span><h1 id="page-title">Claude Code</h1></div>
   </div>
-  <div class="source-tabs" role="tablist" aria-label="Usage source">
-    <button class="source-tab" id="tab-claude_code" role="tab" aria-selected="true" aria-controls="dashboard-panel" onclick="setSource('claude_code')">Claude Code</button>
-    <button class="source-tab" id="tab-codex" role="tab" aria-selected="false" aria-controls="dashboard-panel" onclick="setSource('codex')">Codex</button>
-  </div>
+  <div class="source-tabs" id="source-tabs" role="tablist" aria-label="Usage source"></div>
   <section class="quota-panel" id="quota-panel" aria-labelledby="quota-title">
     <div class="quota-heading"><span class="quota-title" id="quota-title">Usage remaining</span><span class="quota-heading-actions"><button class="quota-refresh" id="quota-refresh" type="button" aria-label="Refresh usage limits" title="Refresh usage limits" onclick="refreshQuota()">&#x21bb;</button></span></div>
     <span class="quota-updated" id="quota-updated">Loading</span>
@@ -806,7 +908,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     Settings
     <span class="nav-dot" id="nav-settings-dot" hidden title="Unsaved changes"></span>
   </button>
-  <button id="rescan-btn" onclick="triggerRescan()" title="Scan now for new usage. Automatic rescans run every 30 minutes and never remove existing history.">&#x21bb; Rescan</button>
+  <button id="rescan-btn" onclick="triggerRescan()" title="Scan now for new usage. Automatic usage updates run every five minutes and never remove existing history.">&#x21bb; Rescan</button>
 </header>
 
 <div id="dashboard-panel" role="tabpanel" aria-live="polite">
@@ -884,6 +986,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </nav>
 
 <div class="container">
+  <section class="unpriced-banner" id="unpriced-model-banner" aria-live="polite" hidden></section>
   <div class="stats-row" id="stats-row"></div>
   <div class="charts-grid">
     <div class="chart-card wide" id="sec-daily" data-card="daily">
@@ -1074,6 +1177,7 @@ function quotaResetText(resetAt) {
 const QUOTA_SOURCE_LABELS = {
   live_api: 'Live',
   live_api_stale: 'Last known',
+  antigravity_local: 'Live',
   local_event: 'Local',
   local_usage: 'Measured',
 };
@@ -1205,6 +1309,7 @@ function pollSignIn(startedAt) {
 
 let quotaRequestInFlight = false;
 async function refreshQuota(manual = true) {
+  if (!((currentProvider || {}).capabilities || {}).quota) return;
   if (quotaRequestInFlight) return;
   const button = document.getElementById('quota-refresh');
   const updated = document.getElementById('quota-updated');
@@ -1232,8 +1337,20 @@ async function refreshQuota(manual = true) {
   }
 }
 
-const SOURCE_LABELS = { claude_code: 'Claude Code', codex: 'Codex' };
-const SOURCE_ORDER = ['claude_code', 'codex'];
+const SOURCE_METADATA = (window.APP_CONFIG || {}).sources || {};
+const SOURCE_ORDER = ((window.APP_CONFIG || {}).source_order || Object.keys(SOURCE_METADATA))
+  .filter(source => SOURCE_METADATA[source]);
+const SOURCE_LABELS = Object.assign(
+  {}, Object.fromEntries(SOURCE_ORDER.map(src => [src, SOURCE_METADATA[src].label || src]))
+);
+
+function renderSourceTabs() {
+  const host = document.getElementById('source-tabs');
+  if (!host || host.children.length) return;
+  host.innerHTML = SOURCE_ORDER.map(source =>
+    `<button class="source-tab" id="tab-${esc(source)}" role="tab" aria-selected="false" aria-controls="dashboard-panel" onclick="setSource('${esc(source)}')">${esc(SOURCE_LABELS[source])}</button>`
+  ).join('');
+}
 
 // ── Settings state ─────────────────────────────────────────────────────────
 // The server injects the stored settings alongside prices (see do_GET), so the
@@ -1252,7 +1369,7 @@ function cloneSettings(value) {
 function normalizeSettings(raw) {
   const sources = (raw && raw.sources) || {};
   const overrides = (raw && raw.pricing_overrides) || {};
-  const out = { sources: {}, pricing_overrides: {} };
+  const out = { schema_version: 2, sources: {}, pricing_overrides: {} };
   SOURCE_ORDER.forEach(src => {
     out.sources[src] = sources[src] !== false;
     const models = overrides[src] || {};
@@ -1341,6 +1458,7 @@ let dispatchesLimit = TABLE_STEPS[0];
 let hourlyTZ = 'local';  // 'local' or 'utc'
 
 function updateSourceTabs() {
+  renderSourceTabs();
   const enabled = enabledSourceList();
   document.querySelectorAll('.source-tab').forEach(tab => {
     const source = tab.id.slice('tab-'.length);
@@ -1371,11 +1489,13 @@ function applyEnabledSources() {
 }
 
 function updateProviderUI() {
-  const provider = currentProvider || { label: SOURCE_LABELS[selectedSource], capabilities: { reasoning_tokens: selectedSource === 'codex', subagents: selectedSource === 'claude_code' } };
+  const provider = currentProvider || SOURCE_METADATA[selectedSource] || {
+    label: SOURCE_LABELS[selectedSource], capabilities: {}
+  };
   const capabilities = provider.capabilities || {};
   const supportsReasoning = capabilities.reasoning_tokens === true;
   const supportsSubagents = capabilities.subagents === true;
-  const isCodex = selectedSource === 'codex';
+  const inputIncludesCache = capabilities.input_includes_cache === true;
   document.body.dataset.source = selectedSource;
   document.body.classList.toggle('provider-no-reasoning', !supportsReasoning);
   const title = document.getElementById('page-title');
@@ -1384,17 +1504,19 @@ function updateProviderUI() {
   const modelTableTitle = document.getElementById('model-table-title');
   if (modelTableTitle) modelTableTitle.textContent = supportsReasoning ? 'Usage by Model' : 'Cost by Model';
   const icon = document.querySelector('.header-icon');
-  if (icon) icon.setAttribute('aria-label', 'TokenScope');
+  if (icon) icon.setAttribute('aria-label', provider.label + ' logo');
   document.querySelectorAll('#sec-subagents, #sec-dispatches, [data-target="sec-subagents"], [data-target="sec-dispatches"]').forEach(el => {
     el.hidden = !supportsSubagents;
   });
   document.querySelectorAll('.reasoning-col').forEach(el => { el.hidden = !supportsReasoning; });
-  document.querySelectorAll('.input-token-label').forEach(el => { el.textContent = isCodex ? 'Uncached Input' : 'Input'; });
-  document.querySelectorAll('.cache-read-label').forEach(el => { el.textContent = isCodex ? 'Cached Input' : 'Cache Read'; });
-  document.querySelectorAll('.cache-write-label').forEach(el => { el.textContent = isCodex ? 'Cache Writes' : 'Cache Creation'; });
+  document.querySelectorAll('.input-token-label').forEach(el => { el.textContent = inputIncludesCache ? 'Uncached Input' : 'Input'; });
+  document.querySelectorAll('.cache-read-label').forEach(el => { el.textContent = inputIncludesCache ? 'Cached Input' : 'Cache Read'; });
+  document.querySelectorAll('.cache-write-label').forEach(el => { el.textContent = inputIncludesCache ? 'Cache Writes' : 'Cache Creation'; });
   const peakLegend = document.querySelector('.peak-legend');
-  if (peakLegend) peakLegend.hidden = selectedSource !== 'claude_code';
-  renderQuota(rawData && rawData.quota);
+  if (peakLegend) peakLegend.hidden = provider.peak_hours !== true;
+  const quotaPanel = document.getElementById('quota-panel');
+  if (quotaPanel) quotaPanel.hidden = capabilities.quota !== true;
+  if (capabilities.quota === true) renderQuota(rawData && rawData.quota);
   updateSourceTabs();
 }
 
@@ -1438,6 +1560,8 @@ function utcHourToDisplay(utcHour, tzMode) {
 }
 
 function isPeakHour(displayHour, tzMode) {
+  const provider = currentProvider || SOURCE_METADATA[selectedSource] || {};
+  if (provider.peak_hours !== true) return false;
   return PEAK_HOURS_UTC.has(displayHourToUTC(displayHour, tzMode));
 }
 
@@ -1462,12 +1586,58 @@ function isBillable(model) {
   return getPricing(model) !== null;
 }
 
+function renderUnpricedModelBanner() {
+  const host = document.getElementById('unpriced-model-banner');
+  if (!host) return;
+  const models = ((rawData && rawData.unpriced_models) || [])
+    .filter(model => model && model !== 'unknown' && !isBillable(model));
+  host.hidden = models.length === 0;
+  if (!models.length) { host.innerHTML = ''; return; }
+  const shown = models.slice(0, 4);
+  const label = (currentProvider && currentProvider.label) || SOURCE_LABELS[selectedSource] || selectedSource;
+  host.innerHTML = `
+    <span class="unpriced-banner-icon" aria-hidden="true">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5v5"/><path d="M12 16.5h.01"/></svg>
+    </span>
+    <span class="unpriced-banner-copy">
+      <span class="unpriced-banner-title">${models.length === 1 ? 'A model needs pricing' : models.length + ' models need pricing'}</span>
+      <span class="unpriced-banner-detail">TokenScope found ${models.length === 1 ? 'a model' : 'models'} in ${esc(label)} logs without saved costs. Usage is included, but cost estimates stay n/a until rates are added.</span>
+    </span>
+    <span class="unpriced-banner-models">
+      ${shown.map(model => `<button type="button" class="unpriced-model-btn" data-unpriced-model="${esc(model)}" title="Add costs for ${esc(model)}">Add costs · ${esc(model)}</button>`).join('')}
+      ${models.length > shown.length ? `<span class="unpriced-more">+${models.length - shown.length} more</span>` : ''}
+    </span>`;
+}
+
+async function openModelPricing(model) {
+  const source = selectedSource;
+  await setView('settings');
+  collapsedPriceGroups.delete(source);
+  priceFilter[source] = '';
+  renderSettingsPricing();
+  const input = document.getElementById('add-model-' + source);
+  if (!input) return;
+  input.value = model;
+  setSettingsStatus('Enter the per-million-token rates for ' + model + ', then add and save it.', null);
+  input.closest('.add-model').scrollIntoView({ behavior: prefersReducedMotion ? 'auto' : 'smooth', block: 'center' });
+  input.focus({ preventScroll: true });
+}
+
+function currentCapabilities() {
+  return (currentProvider && currentProvider.capabilities) ||
+    (SOURCE_METADATA[selectedSource] && SOURCE_METADATA[selectedSource].capabilities) || {};
+}
+
+function inputIncludesCache() {
+  return currentCapabilities().input_includes_cache === true;
+}
+
 function getPricing(model) {
   if (!model) return null;
   const normalized = model.trim().toLowerCase();
   const sourcePricing = PRICING[selectedSource] || {};
   if (sourcePricing[normalized]) return sourcePricing[normalized];
-  for (const key of Object.keys(sourcePricing)) {
+  for (const key of Object.keys(sourcePricing).sort((a, b) => b.length - a.length)) {
     if (normalized.startsWith(key + '-')) return sourcePricing[key];
   }
   return null;
@@ -1491,7 +1661,7 @@ function calcCost(model, inp, out, cacheRead, cacheCreation, longContext) {
   let p = getPricing(model);
   if (!p) return 0;
   if (longContext) p = longContextPrice(p);
-  if (selectedSource === 'codex') {
+  if (inputIncludesCache()) {
     const nonCachedInput = Math.max(inp - cacheRead, 0);
     const cacheWrites = Math.min(cacheCreation || 0, nonCachedInput);
     return ((nonCachedInput - cacheWrites) * p.input + out * p.output
@@ -1505,7 +1675,7 @@ function calcCost(model, inp, out, cacheRead, cacheCreation, longContext) {
 // present at all, are likewise part of prompt input rather than an extra token
 // category.  Claude Code records these fields independently.
 function uncachedInputTokens(input, cacheRead, cacheCreation = 0) {
-  return selectedSource === 'codex' ? Math.max(input - cacheRead - cacheCreation, 0) : input;
+  return inputIncludesCache() ? Math.max(input - cacheRead - cacheCreation, 0) : input;
 }
 
 function displayInputTokens(row) {
@@ -1520,7 +1690,7 @@ function rowCost(row) {
 }
 
 function totalTokenCount(input, output, cacheRead, cacheCreation) {
-  return selectedSource === 'codex'
+  return inputIncludesCache()
     ? input + output
     : input + output + cacheRead + cacheCreation;
 }
@@ -1630,15 +1800,6 @@ function localISODate(d) {
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 }
 
-function rangeIncludesToday(range) {
-  if (range === 'all') return true;
-  const { start, end } = getRangeBounds(range);
-  const today = localISODate(new Date());
-  if (start && today < start) return false;
-  if (end && today > end) return false;
-  return true;
-}
-
 function getRangeBounds(range) {
   if (range === 'custom') return customRange;
   if (range === 'all') return { start: null, end: null };
@@ -1692,7 +1853,6 @@ function setRange(range) {
   closeRangePanel();
   updateURL();
   applyFilter();
-  scheduleAutoRefresh();
 }
 
 function isValidDateRange(start, end) {
@@ -1813,28 +1973,23 @@ function shortModelName(m) {
 
 function readURLModels(allModels) {
   const param = new URLSearchParams(window.location.search).get('models');
-  if (!param) {
-    const billable = allModels.filter(m => isBillable(m));
-    // Fallback: if the user only has non-billable / unknown models (e.g. all
-    // local-LLM runs), default to all models so the dashboard isn't blank.
-    return new Set(billable.length ? billable : allModels);
-  }
+  // Usage visibility must not depend on whether TokenScope knows a model's
+  // price yet. Unknown/private models remain visible with an n/a estimate.
+  if (!param) return new Set(allModels);
   const fromURL = new Set(param.split(',').map(s => s.trim()).filter(Boolean));
   return new Set(allModels.filter(m => fromURL.has(m)));
 }
 
 function isDefaultModelSelection(allModels) {
-  const billable = allModels.filter(m => isBillable(m));
-  const expected = billable.length ? billable : allModels;
-  if (selectedModels.size !== expected.length) return false;
-  return expected.every(m => selectedModels.has(m));
+  if (selectedModels.size !== allModels.length) return false;
+  return allModels.every(m => selectedModels.has(m));
 }
 
 function buildFilterUI(allModels) {
   allModelsList = [...allModels];
   selectedModels = readURLModels(allModels);
   const sorted = sortedModels(allModels);
-  const anthropic = sorted.filter(m => isBillable(m));
+  const priced = sorted.filter(m => isBillable(m));
   const other     = sorted.filter(m => !isBillable(m));
   const rowHTML = m => {
     const checked = selectedModels.has(m);
@@ -1847,13 +2002,13 @@ function buildFilterUI(allModels) {
   let html = '';
   // Only show a group heading when both groups are present — a single-group
   // list doesn't need a label.
-  const labelled = anthropic.length && other.length;
-  if (anthropic.length) {
-    if (labelled) html += '<div class="model-group-label">Anthropic</div>';
-    html += anthropic.map(rowHTML).join('');
+  const labelled = priced.length && other.length;
+  if (priced.length) {
+    if (labelled) html += '<div class="model-group-label">Priced</div>';
+    html += priced.map(rowHTML).join('');
   }
   if (other.length) {
-    if (labelled) html += '<div class="model-group-label">Other providers</div>';
+    if (labelled) html += '<div class="model-group-label">Unpriced</div>';
     html += other.map(rowHTML).join('');
   }
   document.getElementById('model-checkboxes').innerHTML = html;
@@ -1872,12 +2027,12 @@ function updateModelTriggerLabel() {
   const n = selectedModels.size;
   if (n === 0)                    { labelEl.textContent = 'No models';  return; }
   if (n === allModelsList.length) { labelEl.textContent = 'All models'; return; }
-  const anthropic = allModelsList.filter(m => isBillable(m));
+  const priced = allModelsList.filter(m => isBillable(m));
   const others    = allModelsList.filter(m => !isBillable(m));
-  if (anthropic.length && anthropic.every(m => selectedModels.has(m))) {
+  if (priced.length && priced.every(m => selectedModels.has(m))) {
     // n < total (handled above), so when others exist at least one is unselected.
     const otherSel = others.filter(m => selectedModels.has(m)).length;
-    labelEl.textContent = otherSel ? 'All Anthropic +' + otherSel : 'All Anthropic';
+    labelEl.textContent = otherSel ? 'All priced +' + otherSel : 'All priced';
     return;
   }
   const chosen = sortedModels(allModelsList).filter(m => selectedModels.has(m));
@@ -1946,7 +2101,7 @@ function updateURL() {
   const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
   const params = new URLSearchParams();
   if (currentView === 'settings') params.set('view', 'settings');
-  if (selectedSource !== 'claude_code') params.set('source', selectedSource);
+  if (selectedSource !== SOURCE_ORDER[0]) params.set('source', selectedSource);
   if (selectedRange !== '30d') params.set('range', selectedRange);
   if (selectedRange === 'custom') {
     params.set('start', customRange.start);
@@ -1997,6 +2152,8 @@ function sortSessions(sessions) {
 // ── Aggregation & filtering ────────────────────────────────────────────────
 function applyFilter() {
   if (!rawData) return;
+
+  renderUnpricedModelBanner();
 
   const { start, end } = getRangeBounds(selectedRange);
 
@@ -2089,6 +2246,7 @@ function applyFilter() {
       .filter(r => selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end))
       .reduce((s, r) => s + totalTokenCount(r.input, r.output, r.cache_read, r.cache_creation), 0),
     reasoning_output: filteredDaily.reduce((s, r) => s + (r.reasoning_output || 0), 0),
+    has_billable_model: byModel.some(m => isBillable(m.model)),
   };
 
   // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
@@ -2150,7 +2308,7 @@ function renderStats(t) {
   const rangeLabel = RANGE_LABELS[selectedRange].toLowerCase();
   const provider = currentProvider || {};
   const capabilities = provider.capabilities || {};
-  const codexStats = selectedSource === 'codex';
+  const codexStats = inputIncludesCache();
   const stats = [
     { label: 'Sessions',       value: t.sessions.toLocaleString(), sub: rangeLabel },
     { label: 'Turns',          value: fmt(t.turns),                sub: rangeLabel },
@@ -2177,8 +2335,7 @@ function renderStats(t) {
 }
 
 function isBillableModelPresent(t) {
-  return t.cost > 0 || (rawData && rawData.all_models
-    && rawData.all_models.some(model => selectedModels.has(model) && isBillable(model)));
+  return t.has_billable_model === true;
 }
 
 // Bucket rows into 24 hours (display-TZ), summing turns + output, and count
@@ -2300,7 +2457,7 @@ function renderHourlyChart(agg) {
 function renderDailyChart(daily) {
   const ctx = document.getElementById('chart-daily').getContext('2d');
   if (charts.daily) charts.daily.destroy();
-  const codexStats = selectedSource === 'codex';
+  const codexStats = inputIncludesCache();
   const inputLabel = codexStats ? 'Uncached Input' : 'Input';
   const cacheReadLabel = codexStats ? 'Cached Input' : 'Cache Read';
   const tokenDatasets = [
@@ -2383,7 +2540,7 @@ function renderProjectChart(byProject) {
     data: {
       labels: top.map(p => p.project.length > 22 ? '\u2026' + p.project.slice(-20) : p.project),
       datasets: [
-        { label: selectedSource === 'codex' ? 'Uncached Input' : 'Input', hidden: hiddenSeries.project.has(selectedSource === 'codex' ? 'Uncached Input' : 'Input'), data: top.map(p => displayInputTokens(p)), backgroundColor: TOKEN_COLORS.input, hoverBackgroundColor: TOKEN_HOVER.input },
+        { label: inputIncludesCache() ? 'Uncached Input' : 'Input', hidden: hiddenSeries.project.has(inputIncludesCache() ? 'Uncached Input' : 'Input'), data: top.map(p => displayInputTokens(p)), backgroundColor: TOKEN_COLORS.input, hoverBackgroundColor: TOKEN_HOVER.input },
         { label: 'Output', hidden: hiddenSeries.project.has('Output'), data: top.map(p => p.output), backgroundColor: TOKEN_COLORS.output, hoverBackgroundColor: TOKEN_HOVER.output },
       ]
     },
@@ -2717,13 +2874,13 @@ function downloadCSV(reportType, header, rows) {
 }
 
 function codexTokenHeaders() {
-  return selectedSource === 'codex'
+  return inputIncludesCache()
     ? ['Prompt Tokens', 'Uncached Input', 'Cached Input (included in prompt)', 'Cache Writes']
     : ['Input', 'Cache Read', 'Cache Creation'];
 }
 
 function csvTokenValues(row) {
-  return selectedSource === 'codex'
+  return inputIncludesCache()
     ? [row.input, uncachedInputTokens(row.input, row.cache_read, row.cache_creation), row.cache_read, row.cache_creation]
     : [row.input, row.cache_read, row.cache_creation];
 }
@@ -2788,11 +2945,22 @@ async function triggerRescan() {
     const resp = await fetch('/api/rescan', { method: 'POST' });
     const d = await resp.json();
     if (!resp.ok || d.error) throw new Error(d.error || 'Rescan request failed');
-    btn.textContent = '\u21bb Rescan (' + d.new + ' new, ' + d.updated + ' updated)';
+    const sourceResults = Object.values(d.by_source || {});
+    const scanErrors = sourceResults.flatMap(result => result.errors || []);
+    scanErrors.forEach(error => console.error('Usage scan:', error.path, error.message));
+    btn.textContent = d.coalesced
+      ? '\u21bb Usage updated'
+      : '\u21bb Rescan (' + d.new + ' new, ' + d.updated + ' updated'
+        + (scanErrors.length ? ', ' + scanErrors.length + ' errors' : '') + ')';
+    btn.title = scanErrors.length
+      ? scanErrors.length + ' source database(s) could not be read. See the server log or browser console.'
+      : 'Scan now for new usage. Automatic usage updates run every five minutes and never remove existing history.';
     await loadData();
+    return d;
   } catch(e) {
     btn.textContent = '\u21bb Rescan (error)';
     console.error(e);
+    return null;
   } finally {
     rescanInFlight = false;
     if (rescanStatusResetTimer) clearTimeout(rescanStatusResetTimer);
@@ -2820,9 +2988,7 @@ async function loadData() {
       if (rawData === null) setTimeout(loadData, 3000);
       return;
     }
-    const refreshNotes = ['Auto-rescan every 30m'];
-    if (rangeIncludesToday(selectedRange)) refreshNotes.unshift('Auto-refresh every 5m');
-    document.getElementById('meta').innerHTML = 'Updated: ' + esc(d.generated_at) + '<br>' + refreshNotes.join(' · ');
+    document.getElementById('meta').innerHTML = 'Updated: ' + esc(d.generated_at) + '<br>Usage updates every 5m';
 
     const isFirstLoad = rawData === null;
     rawData = d;
@@ -2852,26 +3018,11 @@ async function loadData() {
   }
 }
 
-const DATA_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
-const AUTO_RESCAN_INTERVAL_MS = 30 * 60 * 1000;
-let autoRefreshTimer = null;
-let autoRescanTimer = null;
-let quotaRefreshTimer = null;
-function scheduleAutoRefresh() {
-  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
-  if (quotaRefreshTimer) { clearInterval(quotaRefreshTimer); quotaRefreshTimer = null; }
-  quotaRefreshTimer = setInterval(() => {
-    if (rangeIncludesToday(selectedRange)) renderQuota(rawData && rawData.quota);
-    else refreshQuota(false);
-  }, DATA_REFRESH_INTERVAL_MS);
-  if (rangeIncludesToday(selectedRange)) {
-    autoRefreshTimer = setInterval(loadData, DATA_REFRESH_INTERVAL_MS);
-  }
-}
-
-function scheduleAutoRescan() {
-  if (autoRescanTimer) clearInterval(autoRescanTimer);
-  autoRescanTimer = setInterval(triggerRescan, AUTO_RESCAN_INTERVAL_MS);
+const USAGE_UPDATE_INTERVAL_MS = 5 * 60 * 1000;
+let usageUpdateTimer = null;
+function scheduleUsageUpdates() {
+  if (usageUpdateTimer) clearInterval(usageUpdateTimer);
+  usageUpdateTimer = setInterval(triggerRescan, USAGE_UPDATE_INTERVAL_MS);
 }
 
 // APP_CONFIG is injected server-side (see do_GET).
@@ -3078,9 +3229,27 @@ const FIELD_LABELS = {
   long_output: 'Long output', long_cache_read: 'Long cache read', long_cache_write: 'Long cache write',
 };
 
-let priceFilter = { claude_code: '', codex: '' };
+let priceFilter = {};
 let expandedLongContext = new Set();
 let settingsSaving = false;
+
+// Each provider's model-pricing table can run long (Codex alone ships a dozen
+// models), so every source group folds independently. State persists across
+// renders/reloads the same way the dashboard's card collapse does.
+const PRICE_COLLAPSE_KEY = 'cu_collapsed_price_groups';
+function loadCollapsedPriceGroups() {
+  try { return new Set(JSON.parse(localStorage.getItem(PRICE_COLLAPSE_KEY) || '[]')); }
+  catch (e) { return new Set(); }
+}
+function saveCollapsedPriceGroups() {
+  try { localStorage.setItem(PRICE_COLLAPSE_KEY, JSON.stringify([...collapsedPriceGroups])); } catch (e) {}
+}
+let collapsedPriceGroups = loadCollapsedPriceGroups();
+function togglePriceGroup(source) {
+  if (collapsedPriceGroups.has(source)) collapsedPriceGroups.delete(source); else collapsedPriceGroups.add(source);
+  saveCollapsedPriceGroups();
+  renderSettingsPricing();
+}
 
 function builtinPricing(source) {
   return (SETTINGS_BOOT.builtin_pricing || {})[source] || {};
@@ -3279,11 +3448,14 @@ function renderSettingsPricing() {
     const body = rows.length
       ? rows.map(model => priceRowHTML(source, model)).join('')
       : `<tr><td colspan="${RATE_FIELDS.length + 2}" class="price-empty">No model matches "${esc(filter)}".</td></tr>`;
-    return `<div class="price-group">
-      <div class="price-group-head">
+    const collapsed = collapsedPriceGroups.has(source);
+    return `<div class="price-group${collapsed ? ' collapsed' : ''}" data-price-group="${esc(source)}">
+      <div class="price-group-head" role="button" tabindex="0" aria-expanded="${!collapsed}" title="Collapse / expand ${esc(label)} models">
+        <span class="card-caret">&#9656;</span>
         <span class="price-group-title">${esc(label)}</span>
+        <span class="price-group-count">${rows.length} model${rows.length === 1 ? '' : 's'}</span>
         <span class="price-group-basis">${esc(meta.pricing_basis || '')}</span>
-        <input class="price-filter" type="search" placeholder="Filter models" data-price-filter="${esc(source)}" value="${esc(filter)}">
+        <input class="price-filter" type="search" placeholder="Filter models" data-price-filter="${esc(source)}" value="${esc(filter)}" onclick="event.stopPropagation()">
       </div>
       <div class="price-scroll">
         <table class="price-table">
@@ -3478,6 +3650,9 @@ async function saveSettings() {
       setSettingsStatus(payload.error || 'Could not save settings.', 'error');
       return;
     }
+    const newlyEnabledSources = SOURCE_ORDER.filter(source =>
+      !(savedSettings.sources || {})[source] && (payload.settings.sources || {})[source]
+    );
     savedSettings = normalizeSettings(payload.settings);
     draftSettings = cloneSettings(savedSettings);
     // Re-price the dashboard in place: the effective table just changed, and a
@@ -3486,7 +3661,25 @@ async function saveSettings() {
     renderSettings();
     applyEnabledSources();
     if (rawData) applyFilter();
-    setSettingsStatus('Saved. Prices and providers are live.', 'ok');
+    if (newlyEnabledSources.length) {
+      setSettingsStatus('Saved. Scanning newly enabled usage…', null);
+      let scanResult = await triggerRescan();
+      // If an older startup scan was already active, the coordinator returns
+      // that result without walking the provider we just enabled. Run once
+      // more with the saved source set instead of waiting five minutes.
+      if (scanResult && scanResult.coalesced) scanResult = await triggerRescan();
+      const scanErrors = Object.values((scanResult && scanResult.by_source) || {})
+        .flatMap(result => result.errors || []);
+      setSettingsStatus(
+        scanResult
+          ? 'Saved. Newly enabled usage scanned'
+            + (scanErrors.length ? ' with ' + scanErrors.length + ' source error(s).' : '.')
+          : 'Saved, but the usage scan failed. Use Rescan to try again.',
+        scanResult && !scanErrors.length ? 'ok' : 'error'
+      );
+    } else {
+      setSettingsStatus('Saved. Prices and providers are live.', 'ok');
+    }
   } catch (e) {
     console.error(e);
     setSettingsStatus('Could not reach the dashboard server.', 'error');
@@ -3546,6 +3739,11 @@ function initSettings() {
   const pricingHost = document.getElementById('settings-pricing');
   const sourcesHost = document.getElementById('settings-sources');
 
+  document.getElementById('unpriced-model-banner').addEventListener('click', event => {
+    const button = event.target.closest('[data-unpriced-model]');
+    if (button) openModelPricing(button.dataset.unpricedModel);
+  });
+
   // Rate edits are handled without a re-render so the caret keeps its place;
   // the row's own chrome (badge, Reset button) is refreshed in place instead.
   pricingHost.addEventListener('input', event => {
@@ -3574,6 +3772,11 @@ function initSettings() {
   });
 
   pricingHost.addEventListener('click', event => {
+    const groupHead = event.target.closest('.price-group-head');
+    if (groupHead && !event.target.closest('.price-filter')) {
+      togglePriceGroup(groupHead.closest('.price-group').dataset.priceGroup);
+      return;
+    }
     const button = event.target.closest('button');
     if (!button) return;
     if (button.dataset.addModel) { addModel(button.dataset.addModel); return; }
@@ -3581,6 +3784,14 @@ function initSettings() {
     if (button.dataset.lc) { const [src, model] = split(button.dataset.lc); toggleLongContext(src, model); return; }
     if (button.dataset.reset) { const [src, model] = split(button.dataset.reset); resetModel(src, model); return; }
     if (button.dataset.remove) { const [src, model] = split(button.dataset.remove); removeModel(src, model); return; }
+  });
+
+  pricingHost.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const groupHead = event.target.closest('.price-group-head');
+    if (!groupHead) return;
+    event.preventDefault();
+    togglePriceGroup(groupHead.closest('.price-group').dataset.priceGroup);
   });
 
   sourcesHost.addEventListener('change', event => {
@@ -3639,9 +3850,11 @@ initFooterMeta();
 initSettings();
 initSectionNav();
 updateSourceTabs();
-loadData();
-scheduleAutoRefresh();
-scheduleAutoRescan();
+// Join the CLI's startup scan through the shared coordinator. Otherwise an
+// existing-but-empty source can win the first render and stay at zero until
+// the five-minute timer fires.
+triggerRescan();
+scheduleUsageUpdates();
 </script>
 </body>
 </html>
@@ -3673,7 +3886,9 @@ def find_icon_file():
 # can never be talked into serving an arbitrary path.
 ASSET_ROUTES = {
     "/icon.svg": ("icon.svg", "image/svg+xml"),
+    "/claude-code-icon.svg": ("claude-code-icon.svg", "image/svg+xml"),
     "/codex-icon.svg": ("codex-icon.svg", "image/svg+xml"),
+    "/antigravity-icon.svg": ("antigravity-icon.svg", "image/svg+xml"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
 }
 
@@ -3700,9 +3915,13 @@ def settings_payload(current=None):
         "defaults": settings.defaults(),
         "path": _display_path(settings.SETTINGS_PATH),
         "sources": {
-            source: {"label": config["label"], "pricing_basis": config["pricing_basis"]}
+            source: {"label": config["label"], "short_label": config["short_label"],
+                     "pricing_basis": config["pricing_basis"],
+                     "peak_hours": config.get("peak_hours", False),
+                     "capabilities": config["capabilities"]}
             for source, config in SOURCE_CONFIG.items()
         },
+        "source_order": list(SOURCE_ORDER),
         "builtin_pricing": BUILTIN_PRICING_BY_SOURCE,
         "pricing": pricing.pricing_by_source(),
         "rate_fields": list(settings.RATE_FIELDS),
@@ -3777,6 +3996,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 # even when the user has overridden a rate.
                 "pricing": pricing.pricing_by_source(),
                 "settings": settings_payload(active_settings),
+                "sources": settings_payload(active_settings)["sources"],
+                "source_order": list(SOURCE_ORDER),
             })
             html = HTML_TEMPLATE.replace("__APP_CONFIG_JSON__", config)
             body = html.encode("utf-8")
@@ -3874,14 +4095,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             # frozen at def time and would otherwise target the real paths).
             import scanner
             db_path = DB_PATH
-            result = scanner.scan(
-                db_path=db_path,
-                projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
-                # A provider switched off in Settings is not walked at all, so
-                # disabling Codex really does stop reading ~/.codex.
-                source=settings.scan_source(active_settings),
-                verbose=False,
-            )
+            try:
+                result, coalesced = SCAN_COORDINATOR.run(lambda: scanner.scan(
+                    db_path=db_path,
+                    projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
+                    # A provider switched off in Settings is not walked at all,
+                    # so disabling Codex really does stop reading ~/.codex.
+                    source=settings.scan_sources(active_settings),
+                    antigravity_dir=SCAN_ANTIGRAVITY_DIR,
+                    verbose=False,
+                ))
+            except Exception as exc:
+                self._send_json(500, {"error": f"Usage scan failed: {exc}"})
+                return
+            result = dict(result or {})
+            result["coalesced"] = coalesced
             body = json.dumps(result).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

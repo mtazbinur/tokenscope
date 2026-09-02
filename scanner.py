@@ -11,15 +11,16 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 from pricing import is_long_context
+from sources import (SOURCE_CLAUDE, SOURCE_CODEX, SOURCE_ANTIGRAVITY,
+                     SOURCE_ORDER, normalize_sources)
+import antigravity
 
 # Single source of truth for the app version reported by the CLI (`--version`)
 # and the dashboard footer. CHANGELOG.md is the canonical version reference, but
 # the runtime version has to live here as a constant. Keep this in lockstep with
 # the top CHANGELOG heading (see tests/test_version.py).
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
-SOURCE_CLAUDE = "claude_code"
-SOURCE_CODEX = "codex"
 # Bump this whenever Codex token normalization changes.  Existing transcript
 # files are immutable, so mtime-based incremental scanning alone cannot repair
 # rows written by an older parser.
@@ -27,6 +28,7 @@ CODEX_PARSER_REVISION = "4"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
 CODEX_SESSIONS_DIR = Path(os.environ.get("CODEX_SESSIONS_DIR", Path.home() / ".codex" / "sessions"))
+DEFAULT_ANTIGRAVITY_ROOTS = antigravity.DEFAULT_ANTIGRAVITY_ROOTS
 DB_PATH = Path(os.environ.get("CLAUDE_USAGE_DB", Path.home() / ".claude" / "usage.db"))
 DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
 
@@ -98,7 +100,32 @@ def init_db(conn):
         CREATE TABLE IF NOT EXISTS processed_files (
             path    TEXT PRIMARY KEY,
             mtime   REAL,
-            lines   INTEGER
+            lines   INTEGER,
+            signature TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS source_events (
+            source                  TEXT NOT NULL,
+            origin_path             TEXT NOT NULL,
+            origin_key              TEXT NOT NULL,
+            session_id              TEXT NOT NULL,
+            timestamp               TEXT,
+            timestamp_rank          INTEGER NOT NULL DEFAULT 0,
+            model                   TEXT,
+            provider_code           INTEGER,
+            input_tokens            INTEGER NOT NULL DEFAULT 0,
+            output_tokens           INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens       INTEGER NOT NULL DEFAULT 0,
+            cache_creation_tokens   INTEGER NOT NULL DEFAULT 0,
+            reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+            message_id              TEXT,
+            message_id_rank         INTEGER NOT NULL DEFAULT 0,
+            identities_json         TEXT NOT NULL DEFAULT '[]',
+            parser_revision         TEXT NOT NULL,
+            project_name            TEXT,
+            git_branch              TEXT,
+            topic                   TEXT,
+            PRIMARY KEY (source, origin_path, origin_key)
         );
 
         CREATE TABLE IF NOT EXISTS agents (
@@ -139,6 +166,13 @@ def init_db(conn):
     # Subagent attribution columns (added in a later schema version)
     _ensure_column(conn, "turns", "is_subagent", "INTEGER DEFAULT 0")
     _ensure_column(conn, "turns", "agent_id", "TEXT")
+    _ensure_column(conn, "processed_files", "signature", "TEXT")
+    # Antigravity session context (workspace project, git branch, first-prompt
+    # title), added in a later schema version alongside the materialization
+    # rebuild that populates them from retained staging rows.
+    _ensure_column(conn, "source_events", "project_name", "TEXT")
+    _ensure_column(conn, "source_events", "git_branch", "TEXT")
+    _ensure_column(conn, "source_events", "topic", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_subagent ON turns(is_subagent)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_agent_id ON turns(agent_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_source ON turns(source)")
@@ -231,6 +265,21 @@ def _meta_set(conn, key, value):
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
         (key, value))
+
+
+def _display_scan_path(path):
+    """Keep scan errors useful without exposing an unnecessarily long home path."""
+    try:
+        relative = str(Path(path).expanduser().relative_to(Path.home()))
+        return "~/" + relative.replace(os.sep, "/") if relative else "~"
+    except ValueError:
+        return str(path)
+
+
+def _display_scan_error(message):
+    """Shorten any home path carried inside a parser error message."""
+    home = str(Path.home())
+    return str(message).replace(home, "~")
 
 
 def _extract_title(record):
@@ -932,6 +981,154 @@ def insert_turns(conn, turns):
     ])
 
 
+def _antigravity_event_from_row(row):
+    """Convert a source_events row back into the parser's event shape."""
+    try:
+        identities = json.loads(row["identities_json"] or "[]")
+    except (TypeError, ValueError):
+        identities = []
+    return {
+        "source": SOURCE_ANTIGRAVITY,
+        "origin_path": row["origin_path"],
+        "origin_key": row["origin_key"],
+        "session_id": row["session_id"],
+        "timestamp": row["timestamp"] or "1970-01-01T00:00:00.000Z",
+        "timestamp_rank": row["timestamp_rank"] or 5,
+        "model": row["model"] or "gemini-internal-model",
+        "provider_code": row["provider_code"] or 0,
+        "input_tokens": row["input_tokens"] or 0,
+        "output_tokens": row["output_tokens"] or 0,
+        "cache_read_tokens": row["cache_read_tokens"] or 0,
+        "cache_creation_tokens": row["cache_creation_tokens"] or 0,
+        "reasoning_output_tokens": row["reasoning_output_tokens"] or 0,
+        "message_id": row["message_id"] or "",
+        "message_id_rank": row["message_id_rank"] or 5,
+        "identities": identities,
+        "parser_revision": row["parser_revision"],
+        "project_name": row["project_name"] or "",
+        "git_branch": row["git_branch"] or "",
+        "topic": row["topic"] or "",
+    }
+
+
+def _stage_antigravity_database(conn, filepath, verbose=False):
+    """Replace one mutable source database only after a stable parse."""
+    filepath = str(Path(filepath).resolve())
+    signature = antigravity.database_signature(filepath)
+    row = conn.execute(
+        "SELECT signature FROM processed_files WHERE path = ?", (filepath,)).fetchone()
+    if row and row["signature"] == signature:
+        return "skipped", 0, None
+
+    events = None
+    final_signature = signature
+    for _attempt in range(2):
+        before = antigravity.database_signature(filepath)
+        events = antigravity.parse_database(filepath)
+        after = antigravity.database_signature(filepath)
+        final_signature = after
+        if before == after:
+            break
+    else:
+        return "error", 0, "%s: database changed while reading; retrying next scan" % filepath
+
+    conn.execute(
+        "DELETE FROM source_events WHERE source = ? AND origin_path = ?",
+        (SOURCE_ANTIGRAVITY, filepath))
+    conn.executemany("""
+        INSERT INTO source_events
+            (source, origin_path, origin_key, session_id, timestamp, timestamp_rank,
+             model, provider_code, input_tokens, output_tokens, cache_read_tokens,
+             cache_creation_tokens, reasoning_output_tokens, message_id,
+             message_id_rank, identities_json, parser_revision,
+             project_name, git_branch, topic)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        (SOURCE_ANTIGRAVITY, event["origin_path"], event["origin_key"],
+         event["session_id"], event["timestamp"], event.get("timestamp_rank", 5),
+         event.get("model"), event.get("provider_code", 0), event["input_tokens"],
+         event["output_tokens"], event["cache_read_tokens"],
+         event["cache_creation_tokens"], event.get("reasoning_output_tokens", 0),
+         event.get("message_id", ""), event.get("message_id_rank", 5),
+         json.dumps(sorted(event.get("identities", ()))),
+         event.get("parser_revision", antigravity.ANTIGRAVITY_PARSER_REVISION),
+         event.get("project_name", ""), event.get("git_branch", ""),
+         event.get("topic", ""))
+        for event in events
+    ])
+    mtime = os.path.getmtime(filepath)
+    conn.execute("""
+        INSERT OR REPLACE INTO processed_files (path, mtime, lines, signature)
+        VALUES (?, ?, ?, ?)
+    """, (filepath, mtime, 0, final_signature))
+    return ("new" if row is None else "updated"), len(events), None
+
+
+def _materialize_antigravity(conn):
+    """Rebuild only Antigravity's normalized slice from retained staging rows."""
+    rows = conn.execute(
+        "SELECT * FROM source_events WHERE source = ? ORDER BY origin_path, origin_key",
+        (SOURCE_ANTIGRAVITY,)).fetchall()
+    events = antigravity.deduplicate_events(
+        [_antigravity_event_from_row(row) for row in rows])
+    conn.execute("DELETE FROM turns WHERE source = ?", (SOURCE_ANTIGRAVITY,))
+    conn.execute("DELETE FROM sessions WHERE source = ?", (SOURCE_ANTIGRAVITY,))
+    turns = []
+    for event in events:
+        identities = sorted(event.get("identities", ()))
+        identity_payload = "|".join(identities) if identities else (
+            event.get("origin_path", "") + "|" + event.get("origin_key", ""))
+        record_id = "antigravity:" + hashlib.sha256(identity_payload.encode("utf-8")).hexdigest()
+        prompt_tokens = (event["input_tokens"] + event["cache_read_tokens"]
+                         + event["cache_creation_tokens"])
+        turns.append({
+            "source": SOURCE_ANTIGRAVITY,
+            "session_id": event["session_id"],
+            "timestamp": event["timestamp"],
+            "model": event.get("model") or "gemini-internal-model",
+            "input_tokens": event["input_tokens"],
+            "output_tokens": event["output_tokens"],
+            "cache_read_tokens": event["cache_read_tokens"],
+            "cache_creation_tokens": event["cache_creation_tokens"],
+            "tool_name": None,
+            "cwd": "",
+            "message_id": event.get("message_id", ""),
+            "source_record_id": record_id,
+            "reasoning_output_tokens": event.get("reasoning_output_tokens", 0),
+            "is_long_context": int(is_long_context(
+                event.get("model"), prompt_tokens, source=SOURCE_ANTIGRAVITY)),
+            "is_subagent": 0,
+            "agent_id": None,
+        })
+    insert_turns(conn, turns)
+    metas = {}
+    for event in events:
+        sid = event["session_id"]
+        meta = metas.setdefault(sid, {
+            "source": SOURCE_ANTIGRAVITY,
+            "session_id": sid,
+            "project_name": "Antigravity",
+            "first_timestamp": event["timestamp"],
+            "last_timestamp": event["timestamp"],
+            "git_branch": "",
+            "model": None,
+            "topic": None,
+        })
+        meta["first_timestamp"] = min(meta["first_timestamp"], event["timestamp"])
+        meta["last_timestamp"] = max(meta["last_timestamp"], event["timestamp"])
+        # Workspace/branch/title are constant per session (one conversation
+        # database), but fall back gracefully if a duplicate copy is missing them.
+        if event.get("project_name") and meta["project_name"] == "Antigravity":
+            meta["project_name"] = project_name_from_cwd(event["project_name"])
+        if event.get("git_branch") and not meta["git_branch"]:
+            meta["git_branch"] = event["git_branch"]
+        if event.get("topic") and not meta["topic"]:
+            meta["topic"] = event["topic"]
+    sessions = aggregate_sessions(list(metas.values()), turns)
+    upsert_sessions(conn, sessions)
+    return len(turns), len(sessions)
+
+
 def _codex_rollout_metadata(filepath):
     """Read the tiny amount of metadata needed to identify spawned rollouts."""
     try:
@@ -1016,18 +1213,39 @@ def _codex_replay_prefixes(codex_paths, changed_paths):
 
 
 def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True,
-         source=SOURCE_CLAUDE, codex_dir=None):
-    """Scan Claude Code and/or Codex transcripts into the shared database."""
+         source=SOURCE_CLAUDE, codex_dir=None, antigravity_dir=None):
+    """Scan enabled local provider data into the shared database.
+
+    ``source`` remains scalar-compatible for callers and accepts ``all`` or an
+    iterable for the Settings-driven collection contract.
+    """
+    if source is None:
+        # Preserve the historical API behavior for callers that explicitly
+        # passed None; the CLI/settings paths pass an intentional source set.
+        selected_sources = (SOURCE_CLAUDE,)
+    elif source == "all":
+        selected_sources = SOURCE_ORDER
+    elif isinstance(source, str):
+        if source not in SOURCE_ORDER:
+            raise ValueError(f"Unknown source: {source}")
+        selected_sources = (source,)
+    else:
+        requested = tuple(source or ())
+        unknown = [item for item in requested if item not in SOURCE_ORDER]
+        if unknown:
+            raise ValueError(f"Unknown source: {unknown[0]}")
+        selected_sources = normalize_sources(requested)
+        if not selected_sources:
+            raise ValueError("At least one source is required")
+
+    # Validate the user-facing selector before opening or creating the
+    # TokenScope database.  A typo in --source must be side-effect free.
     conn = get_db(db_path)
     init_db(conn)
 
-    source_filter = source or SOURCE_CLAUDE
-    if source_filter not in ("all", SOURCE_CLAUDE, SOURCE_CODEX):
-        raise ValueError(f"Unknown source: {source_filter}")
-
     files_to_scan = []
     claude_files = []
-    if source_filter in ("all", SOURCE_CLAUDE):
+    if SOURCE_CLAUDE in selected_sources:
         if projects_dirs:
             claude_dirs = [Path(d) for d in projects_dirs]
         elif projects_dir:
@@ -1043,13 +1261,26 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True,
             claude_files.extend(found)
             files_to_scan.extend((path, SOURCE_CLAUDE) for path in found)
 
-    if source_filter in ("all", SOURCE_CODEX):
+    if SOURCE_CODEX in selected_sources:
         directory = Path(codex_dir) if codex_dir else CODEX_SESSIONS_DIR
         if directory.exists():
             if verbose:
                 print(f"Scanning {directory} ...")
             found = glob.glob(str(directory / "**" / "*.jsonl"), recursive=True)
             files_to_scan.extend((path, SOURCE_CODEX) for path in found)
+
+    antigravity_paths = []
+    antigravity_discovery_errors = []
+    if SOURCE_ANTIGRAVITY in selected_sources:
+        antigravity_roots = antigravity_dir
+        if antigravity_roots is None and not os.environ.get("ANTIGRAVITY_DATA_DIR"):
+            antigravity_roots = DEFAULT_ANTIGRAVITY_ROOTS
+        if isinstance(antigravity_roots, (str, os.PathLike)):
+            antigravity_roots = [part.strip() for part in str(antigravity_roots).split(",") if part.strip()]
+        antigravity_paths = antigravity.discover_databases(
+            antigravity_roots, errors=antigravity_discovery_errors)
+        if verbose and antigravity_paths:
+            print(f"Scanning Antigravity ({len(antigravity_paths)} database(s)) ...")
 
     files_to_scan.sort()
     claude_files.sort()
@@ -1106,7 +1337,63 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True,
     by_source = {
         SOURCE_CLAUDE: {"new": 0, "updated": 0, "skipped": 0, "turns": 0, "sessions": 0},
         SOURCE_CODEX: {"new": 0, "updated": 0, "skipped": 0, "turns": 0, "sessions": 0},
+        SOURCE_ANTIGRAVITY: {"new": 0, "updated": 0, "skipped": 0, "turns": 0, "sessions": 0, "errors": []},
     }
+    by_source[SOURCE_ANTIGRAVITY]["errors"].extend(
+        {"path": _display_scan_path(path), "message": message}
+        for path, message in antigravity_discovery_errors)
+
+    by_source[SOURCE_ANTIGRAVITY]["databases"] = len(antigravity_paths)
+    antigravity_changed = False
+    try:
+        for filepath in antigravity_paths:
+            try:
+                status, event_count, error = _stage_antigravity_database(
+                    conn, filepath, verbose=verbose)
+            except (OSError, antigravity.AntigravityError) as exc:
+                status, event_count, error = "error", 0, str(exc)
+            if status == "error":
+                by_source[SOURCE_ANTIGRAVITY]["errors"].append({
+                    "path": _display_scan_path(filepath),
+                    "message": _display_scan_error(error),
+                })
+                continue
+            by_source[SOURCE_ANTIGRAVITY][status] += 1
+            by_source[SOURCE_ANTIGRAVITY]["turns"] += event_count
+            antigravity_changed |= status in ("new", "updated")
+            if status == "new":
+                new_files += 1
+            elif status == "updated":
+                updated_files += 1
+            else:
+                skipped_files += 1
+
+        # Stage replacement, normalized replacement, signatures, and the
+        # materialization marker are one transaction. The marker also repairs
+        # rows staged by an interrupted older build even when all files skip.
+        needs_materialization = (
+            SOURCE_ANTIGRAVITY in selected_sources
+            and (antigravity_changed or _meta_get(
+                conn, "antigravity_materialized_revision")
+                != antigravity.ANTIGRAVITY_PARSER_REVISION)
+        )
+        if needs_materialization:
+            materialized_turns, materialized_sessions = _materialize_antigravity(conn)
+            _meta_set(conn, "antigravity_materialized_revision",
+                      antigravity.ANTIGRAVITY_PARSER_REVISION)
+            by_source[SOURCE_ANTIGRAVITY]["turns"] = materialized_turns
+            by_source[SOURCE_ANTIGRAVITY]["sessions"] = materialized_sessions
+            total_turns += materialized_turns
+            total_sessions.update(
+                (SOURCE_ANTIGRAVITY, row["session_id"])
+                for row in conn.execute(
+                    "SELECT session_id FROM sessions WHERE source = ?",
+                    (SOURCE_ANTIGRAVITY,)))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        conn.close()
+        raise
 
     for filepath, file_source in files_to_scan:
         try:

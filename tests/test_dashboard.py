@@ -72,6 +72,31 @@ class TestGetDashboardData(unittest.TestCase):
         data = get_dashboard_data(db_path=self.db_path)
         self.assertIn("claude-sonnet-4-6", data["all_models"])
 
+    def test_unpriced_models_are_reported_until_rates_exist(self):
+        conn = get_db(self.db_path)
+        insert_turns(conn, [{
+            "session_id": "sess-new-model", "timestamp": "2026-04-08T15:00:00Z",
+            "model": "claude-future-9", "input_tokens": 100,
+            "output_tokens": 25, "cache_read_tokens": 0,
+            "cache_creation_tokens": 0, "tool_name": None, "cwd": "/tmp",
+        }])
+        conn.commit()
+        conn.close()
+
+        data = get_dashboard_data(db_path=self.db_path)
+        self.assertEqual(data["unpriced_models"], ["claude-future-9"])
+
+        dashboard.pricing.set_overrides({SOURCE_CLAUDE: {
+            "claude-future-9": {
+                "input": 1, "output": 2, "cache_read": 0.1, "cache_write": 1.25,
+            },
+        }})
+        try:
+            data = get_dashboard_data(db_path=self.db_path)
+            self.assertNotIn("claude-future-9", data["unpriced_models"])
+        finally:
+            dashboard.pricing.set_overrides(None)
+
     def test_sessions_populated(self):
         data = get_dashboard_data(db_path=self.db_path)
         self.assertEqual(len(data["sessions_all"]), 1)
@@ -186,6 +211,7 @@ class TestCodexDashboardData(unittest.TestCase):
         self.assertEqual(data["label"], "Codex")
         self.assertEqual(data["capabilities"], {
             "cache": True, "reasoning_tokens": True, "subagents": False,
+            "quota": True, "input_includes_cache": True,
         })
         self.assertEqual(data["all_models"], ["gpt-5.6-sol"])
         self.assertEqual(data["daily_by_model"][0]["reasoning_output"], 7)
@@ -268,6 +294,7 @@ class TestEmptyStringModelNormalization(unittest.TestCase):
         data = get_dashboard_data(db_path=self.db_path)
         self.assertIn("unknown", data["all_models"])
         self.assertNotIn("", data["all_models"])
+        self.assertNotIn("unknown", data["unpriced_models"])
 
     def test_daily_by_model_contains_unknown_not_empty(self):
         data = get_dashboard_data(db_path=self.db_path)
@@ -347,14 +374,62 @@ class TestMixedNullAndEmptyModel(unittest.TestCase):
 
 
 class TestNonBillableModelFallback(unittest.TestCase):
-    """Regression: when the user has only non-billable models (e.g. gemma, glm,
-    local LLMs) — or all turns lack a model field — the default model selection
-    must fall back to ALL models so the dashboard isn't blank."""
+    """Unknown models remain usage-visible even when priced models also exist."""
 
     def test_readurlmodels_fallback_in_html_template(self):
-        # The fallback logic is JS; we assert the source contains the guard so
-        # a future refactor doesn't silently remove it.
-        self.assertIn("billable.length ? billable : allModels", HTML_TEMPLATE)
+        self.assertIn("if (!param) return new Set(allModels);", HTML_TEMPLATE)
+        self.assertIn("Unknown/private models remain visible", HTML_TEMPLATE)
+
+    def test_unpriced_banner_links_to_the_add_model_workflow(self):
+        self.assertIn('id="unpriced-model-banner"', HTML_TEMPLATE)
+        self.assertIn("function renderUnpricedModelBanner()", HTML_TEMPLATE)
+        self.assertIn("async function openModelPricing(model)", HTML_TEMPLATE)
+        self.assertIn("data-unpriced-model", HTML_TEMPLATE)
+
+    def test_each_provider_has_an_explicit_sidebar_logo(self):
+        self.assertIn('body[data-source="claude_code"] { --provider-logo: url("claude-code-icon.svg"); }', HTML_TEMPLATE)
+        self.assertIn('body[data-source="codex"] { --provider-logo: url("codex-icon.svg"); }', HTML_TEMPLATE)
+        self.assertIn('body[data-source="antigravity"] { --provider-logo: url("antigravity-icon.svg"); }', HTML_TEMPLATE)
+
+    def test_claude_sidebar_logo_uses_the_claude_mark_as_a_tintable_mask(self):
+        icon = (Path(dashboard.__file__).parent / "resources" / "claude-code-icon.svg").read_text()
+        self.assertIn('viewBox="0 0 1200 1200"', icon)
+        self.assertIn('fill="#fff"', icon)
+        self.assertIn('aria-label="Claude Code"', icon)
+        self.assertNotIn("<rect", icon)
+        self.assertNotIn("stroke=", icon)
+
+
+class TestScanCoordinator(unittest.TestCase):
+    def test_concurrent_call_waits_for_and_reuses_active_scan(self):
+        coordinator = dashboard.ScanCoordinator()
+        scan_started = threading.Event()
+        release_scan = threading.Event()
+        calls = []
+        results = []
+
+        def slow_scan():
+            calls.append("scan")
+            scan_started.set()
+            self.assertTrue(release_scan.wait(timeout=2))
+            return {"new": 2, "updated": 1, "skipped": 3}
+
+        first = threading.Thread(target=lambda: results.append(coordinator.run(slow_scan)))
+        second = threading.Thread(target=lambda: results.append(coordinator.run(slow_scan)))
+        first.start()
+        self.assertTrue(scan_started.wait(timeout=2))
+        second.start()
+        release_scan.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(calls, ["scan"])
+        self.assertCountEqual(results, [
+            ({"new": 2, "updated": 1, "skipped": 3}, False),
+            ({"new": 2, "updated": 1, "skipped": 3}, True),
+        ])
 
 
 class TestDashboardHTTP(unittest.TestCase):
@@ -374,12 +449,15 @@ class TestDashboardHTTP(unittest.TestCase):
         tmp_projects.mkdir()
         tmp_codex = tmp / "codex"
         tmp_codex.mkdir()
+        tmp_antigravity = tmp / "antigravity"
+        (tmp_antigravity / "conversations").mkdir(parents=True)
         cls._patches = {
             (_d, "DB_PATH"):                (_d.DB_PATH,                tmp / "usage.db"),
             (_s, "DB_PATH"):                (_s.DB_PATH,                tmp / "usage.db"),
             (_s, "PROJECTS_DIR"):           (_s.PROJECTS_DIR,           tmp_projects),
             (_s, "DEFAULT_PROJECTS_DIRS"):  (_s.DEFAULT_PROJECTS_DIRS,  [tmp_projects]),
             (_s, "CODEX_SESSIONS_DIR"):     (_s.CODEX_SESSIONS_DIR,     tmp_codex),
+            (_s, "DEFAULT_ANTIGRAVITY_ROOTS"): (_s.DEFAULT_ANTIGRAVITY_ROOTS, (tmp_antigravity,)),
             # Every request calls settings.apply(); without this the handler
             # would read (and /api/settings would write) the developer's real
             # ~/.claude/tokenscope-settings.json, and a disabled provider there
@@ -416,6 +494,13 @@ class TestDashboardHTTP(unittest.TestCase):
             with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/{qs}") as resp:
                 self.assertEqual(resp.status, 200)
                 self.assertIn(b"TokenScope", resp.read())
+
+    def test_antigravity_icon_is_served(self):
+        url = f"http://127.0.0.1:{self.port}/antigravity-icon.svg"
+        with urllib.request.urlopen(url) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.headers["Content-Type"], "image/svg+xml")
+            self.assertIn(b"<svg", resp.read())
 
     def test_api_data_with_query_string(self):
         # /api/data is fetched without query parameters today, but the route
@@ -525,6 +610,7 @@ class TestDashboardHTTP(unittest.TestCase):
             self.assertIn("new", data)
             self.assertIn("updated", data)
             self.assertIn("skipped", data)
+            self.assertIs(data["coalesced"], False)
 
     def test_api_rescan_is_non_destructive(self):
         # Regression (#138): /api/rescan must NOT wipe the DB. usage.db is the
@@ -608,12 +694,12 @@ class TestHTMLTemplate(unittest.TestCase):
         self.assertIn("chart.js", HTML_TEMPLATE.lower())
 
     def test_provider_tabs_are_present(self):
-        self.assertIn('id="tab-claude_code"', HTML_TEMPLATE)
-        self.assertIn('id="tab-codex"', HTML_TEMPLATE)
+        self.assertIn('id="source-tabs"', HTML_TEMPLATE)
+        self.assertIn("renderSourceTabs", HTML_TEMPLATE)
+        self.assertIn("antigravity", HTML_TEMPLATE)
         self.assertIn('<h1 id="page-title">Claude Code</h1>', HTML_TEMPLATE)
         self.assertIn("title.textContent = provider.label", HTML_TEMPLATE)
-        self.assertIn("setSource('claude_code')", HTML_TEMPLATE)
-        self.assertIn("setSource('codex')", HTML_TEMPLATE)
+        self.assertIn("setSource(source)", HTML_TEMPLATE)
         self.assertIn("/api/data?source=", HTML_TEMPLATE)
 
     def test_provider_tab_always_leaves_settings_before_source_short_circuit(self):
@@ -628,16 +714,16 @@ class TestHTMLTemplate(unittest.TestCase):
         )
         self.assertIn("if (currentView !== 'dashboard') return;", handler)
 
-    def test_auto_rescan_runs_every_thirty_minutes_without_overlap(self):
+    def test_usage_update_scans_every_five_minutes_without_overlap(self):
         self.assertIn(
-            "const AUTO_RESCAN_INTERVAL_MS = 30 * 60 * 1000;",
+            "const USAGE_UPDATE_INTERVAL_MS = 5 * 60 * 1000;",
             HTML_TEMPLATE,
         )
         self.assertIn(
-            "autoRescanTimer = setInterval(triggerRescan, AUTO_RESCAN_INTERVAL_MS);",
+            "usageUpdateTimer = setInterval(triggerRescan, USAGE_UPDATE_INTERVAL_MS);",
             HTML_TEMPLATE,
         )
-        self.assertIn("scheduleAutoRescan();", HTML_TEMPLATE)
+        self.assertIn("scheduleUsageUpdates();", HTML_TEMPLATE)
 
         start = HTML_TEMPLATE.index("async function triggerRescan()")
         end = HTML_TEMPLATE.index("// ── Data loading", start)
@@ -645,18 +731,25 @@ class TestHTMLTemplate(unittest.TestCase):
         self.assertIn("if (rescanInFlight) return;", handler)
         self.assertIn("rescanInFlight = true;", handler)
         self.assertIn("rescanInFlight = false;", handler)
+        self.assertIn("await loadData();", handler)
+        self.assertIn("scanErrors", handler)
+        self.assertIn("errors'", handler)
 
-    def test_auto_rescan_does_not_replace_five_minute_data_refresh(self):
+    def test_initial_render_joins_startup_scan_and_enabling_scans_immediately(self):
         self.assertIn(
-            "const DATA_REFRESH_INTERVAL_MS = 5 * 60 * 1000;",
+            "// Join the CLI's startup scan through the shared coordinator.",
             HTML_TEMPLATE,
         )
-        self.assertIn(
-            "autoRefreshTimer = setInterval(loadData, DATA_REFRESH_INTERVAL_MS);",
-            HTML_TEMPLATE,
-        )
-        self.assertIn("Auto-refresh every 5m", HTML_TEMPLATE)
-        self.assertIn("Auto-rescan every 30m", HTML_TEMPLATE)
+        self.assertIn("newlyEnabledSources", HTML_TEMPLATE)
+        self.assertIn("let scanResult = await triggerRescan();", HTML_TEMPLATE)
+        self.assertIn("scanResult && scanResult.coalesced", HTML_TEMPLATE)
+
+    def test_usage_update_replaces_data_only_refresh_and_thirty_minute_rescan(self):
+        self.assertIn("Usage updates every 5m", HTML_TEMPLATE)
+        self.assertNotIn("DATA_REFRESH_INTERVAL_MS", HTML_TEMPLATE)
+        self.assertNotIn("AUTO_RESCAN_INTERVAL_MS", HTML_TEMPLATE)
+        self.assertNotIn("scheduleAutoRefresh", HTML_TEMPLATE)
+        self.assertNotIn("scheduleAutoRescan", HTML_TEMPLATE)
 
     def test_sidebar_has_provider_aware_identity_and_quota_panel(self):
         self.assertIn('id="quota-panel"', HTML_TEMPLATE)
@@ -667,12 +760,17 @@ class TestHTMLTemplate(unittest.TestCase):
         self.assertIn("refreshQuota", HTML_TEMPLATE)
         self.assertIn("remaining_percent", HTML_TEMPLATE)
         self.assertIn("quotaResetText", HTML_TEMPLATE)
+        self.assertIn("max-height: 240px", HTML_TEMPLATE)
+        self.assertIn("overflow-y: auto", HTML_TEMPLATE)
+        self.assertIn("scrollbar-color: var(--border-strong) transparent", HTML_TEMPLATE)
 
     def test_provider_capabilities_drive_provider_specific_ui(self):
         self.assertIn("reasoning_tokens", HTML_TEMPLATE)
         self.assertIn("capabilities", HTML_TEMPLATE)
         self.assertIn("sec-subagents", HTML_TEMPLATE)
         self.assertIn("reasoning-col", HTML_TEMPLATE)
+        self.assertIn("[hidden] { display: none !important; }", HTML_TEMPLATE)
+        self.assertIn("has_billable_model: byModel.some", HTML_TEMPLATE)
 
     def test_codex_prompt_and_cache_accounting_are_not_additive(self):
         """Codex input includes cached input; cache writes are also prompt input."""

@@ -248,6 +248,12 @@ VOLUMES=(-v "$HOME/.claude:/root/.claude:ro")
 if [[ -d "$HOME/.codex" ]]; then
   VOLUMES+=(-v "$HOME/.codex:/root/.codex:ro")
 fi
+if [[ -d "$HOME/.gemini" ]]; then
+  VOLUMES+=(-v "$HOME/.gemini:/root/.gemini:ro")
+fi
+if [[ -d "$HOME/.config/antigravity" ]]; then
+  VOLUMES+=(-v "$HOME/.config/antigravity:/root/.config/antigravity:ro")
+fi
 
 printf '%s  Starting container...\n' "🚀"
 # No --rm: keeping the exited container means `docker logs` still works after a

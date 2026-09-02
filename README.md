@@ -6,7 +6,7 @@
 
 **Your subscription gives you a progress bar. This gives you the whole picture.**
 
-Claude Code and Codex both write detailed usage logs to your own disk — token counts,
+Claude Code, Codex, and Antigravity write local usage metadata to your own disk — token counts,
 models, sessions, projects, subagents — no matter which plan you are on. TokenScope
 reads those logs and turns them into charts, tables, and cost estimates. Each provider
 keeps its own tab, so models and pricing are never mixed.
@@ -40,13 +40,16 @@ Captured:
 - **Claude Code CLI** — `~/.claude/projects/`
 - **Claude in Xcode** — the coding-assistant transcript directory
 - **Codex** — local rollout sessions in `~/.codex/sessions/`
+- **Antigravity** — local conversation databases below `~/.gemini/antigravity*/conversations/`
+  and `~/.config/antigravity/conversations/`. TokenScope reads only metadata BLOBs,
+  never prompts or responses.
 
 Not captured:
 
 - **Cowork sessions** — these run server-side and write no local JSONL transcript.
 
 What you get per provider: session and turn counts, input / output / cache-read /
-cache-write tokens, reasoning tokens (Codex), estimated cost, a daily chart with a
+cache-write tokens, reasoning tokens (Codex and Antigravity), estimated cost, a daily chart with a
 cost overlay, an average-hourly-distribution chart, and tables by model, project,
 project × branch, session, and subagent dispatch. Every table exports to CSV, every
 section collapses, and the date range and model filter live in the URL so a view can
@@ -55,7 +58,10 @@ be bookmarked.
 The sidebar also shows **usage remaining** per plan-limit window. Codex limits are
 read from local rollout data. For Claude, TokenScope uses Claude Code's local sign-in
 to request the current limits from Anthropic's OAuth usage endpoint; transcript
-contents are not included in that request.
+contents are not included in that request. Antigravity has no authoritative local
+quota contract, so it shows historical usage without a fabricated remaining-plan
+card. Its costs are underlying-model API-equivalent estimates, not Antigravity
+subscription billing.
 
 The dashboard loads Chart.js from jsDelivr. Apart from that browser asset and the
 Claude usage-limit request above, transcript scanning and reporting stay on your
@@ -93,7 +99,7 @@ Then launch the dashboard from anywhere:
 tokenscope dashboard
 ```
 
-That scans your local Claude Code and Codex logs and opens <http://localhost:8080>.
+That scans your local Claude Code, Codex, and enabled Antigravity metadata and opens <http://localhost:8080>.
 Both installers keep TokenScope in an isolated environment; the application itself
 has no third-party runtime dependencies.
 
@@ -128,6 +134,8 @@ the container with:
 
 - `~/.claude` mounted **read-only** — the container can read your transcripts, never modify them
 - `~/.codex` mounted **read-only when present**
+- `~/.gemini` mounted **read-only when present** (only documented Antigravity paths are scanned)
+- `~/.config/antigravity` mounted **read-only when present**
 - a named volume (`tokenscope-data`) for the SQLite database and your settings file,
   persisted across restarts and isolated from your home directory
 
@@ -143,16 +151,18 @@ The examples below assume installation with `uv` or `pipx`. When running from so
 replace `tokenscope` with `python3 cli.py` on macOS/Linux or `python cli.py` on Windows.
 
 ```bash
-# Scan Claude Code and Codex logs into ~/.claude/usage.db
+# Scan enabled local usage data into ~/.claude/usage.db
 tokenscope scan
 
 # Scan one provider explicitly
 tokenscope scan --source claude_code
 tokenscope scan --source codex
+tokenscope scan --source antigravity
 
 # Scan from custom locations
 tokenscope scan --projects-dir /path/to/transcripts
 tokenscope scan --source codex --codex-dir /path/to/codex/sessions
+tokenscope scan --source antigravity --antigravity-dir /path/to/data/root
 
 # Terminal summaries
 tokenscope today          # today, by model
@@ -167,12 +177,17 @@ tokenscope dashboard --no-browser
 # Environment variables work too
 HOST=0.0.0.0 PORT=9000 tokenscope dashboard
 
+# Antigravity roots may be comma-separated
+ANTIGRAVITY_DATA_DIR=/one,/two tokenscope scan --source antigravity
+
 tokenscope --version
 ```
 
 The scanner is incremental: it records each file's path, mtime, and line count, so
-re-running `scan` only processes what is new. The dashboard rescans automatically every
-30 minutes; **Rescan** in the sidebar triggers the same non-destructive update immediately.
+re-running `scan` only processes what is new (Antigravity databases are reparsed when
+their SQLite or WAL signature changes). The dashboard scans for new usage and reloads
+the displayed costs automatically every five minutes; **Rescan** in the sidebar triggers
+the same non-destructive update immediately.
 
 ---
 
@@ -185,9 +200,10 @@ Open **Settings** from the sidebar, or go straight to `?view=settings`.
 ### Providers
 
 Switch a provider off and it disappears from the sidebar, its usage limits stop being
-polled, and `scan` stops walking its log directory entirely. If you don't use Codex,
-nothing about Codex is read. Both providers are on by default, and at least one has to
-stay on.
+polled, and `scan` stops walking its log directory entirely. If you don't use Codex or
+Antigravity, nothing about that provider is read. New installs and schema-v1 upgrades
+enable all three by default; you can opt out before the next scan. At least one
+provider has to stay on.
 
 ### Model pricing
 
@@ -241,6 +257,13 @@ models ship with prices; a sample:
 | `gpt-5.6-terra` | $2.00 | $12.00 | $2.50 | $0.20 |
 | `gpt-5.6-luna` | $0.20 | $1.20 | $0.25 | $0.02 |
 
+**Antigravity** — underlying-model API-equivalent estimates, not plan billing
+
+| Model | Input | Output | Cache write | Cache read |
+|---|---|---|---|---|
+| `gemini-2.5-pro` | $1.25 | $10.00 | $1.25 | $0.125 |
+| `gemini-2.5-flash` | $0.30 | $2.50 | $0.30 | $0.03 |
+
 Two things worth knowing:
 
 - **A model with no entry costs $0 and shows as `n/a`.** That is deliberate, so a local
@@ -258,7 +281,9 @@ Two things worth knowing:
 ```
 ~/.claude/projects/**/*.jsonl  ─┐
 Xcode coding-assistant dir     ─┼─→  scanner.parse_jsonl_file()
-~/.codex/sessions/**/*.jsonl   ─┘            │
+~/.codex/sessions/**/*.jsonl   ─┐           │
+~/.gemini/.../conversations/*.db ─┤         │
+~/.config/antigravity/.../*.db ───┘         │
                                              ▼
                           aggregate_sessions() → SQLite (~/.claude/usage.db)
                                              │
@@ -277,11 +302,18 @@ Codex rollout files are read from `~/.codex/sessions/` using session metadata, t
 context, and each response's `last_token_usage`; cumulative snapshots are never summed
 twice, and reasoning output is kept as its own breakdown.
 
+Antigravity conversation databases are opened read-only. `gen_metadata` and optional
+`steps` metadata are decoded without a protobuf dependency, staged with database/WAL
+signatures, and deduplicated across generation rows, retries, and copied databases by
+their response/provider/message identities. A deleted source database does not delete
+already imported history.
+
 `dashboard.py` serves a single-page app from one embedded HTML string, with Chart.js
 loaded from CDN. `GET /api/data` returns the whole history and the browser filters it,
-so changing the range or the model filter costs no round trip. It reloads SQLite data
-every five minutes when the selected range includes today, and incrementally rescans the
-local log files every 30 minutes.
+so changing the range or the model filter costs no round trip. Every five minutes the
+dashboard incrementally scans the enabled providers' local logs, then reloads SQLite so
+new usage and costs appear together. Concurrent tabs share one in-process scan and do not
+start overlapping filesystem walks or SQLite writers.
 
 ---
 
@@ -289,7 +321,9 @@ local log files every 30 minutes.
 
 | File | Purpose |
 |---|---|
-| [scanner.py](scanner.py) | Parses JSONL transcripts into `~/.claude/usage.db`; holds `VERSION` |
+| [scanner.py](scanner.py) | Coordinates provider scans into `~/.claude/usage.db`; holds `VERSION` |
+| [antigravity.py](antigravity.py) | Read-only SQLite/protobuf Antigravity adapter |
+| [sources.py](sources.py) | Canonical provider ids and order |
 | [cli.py](cli.py) | `scan`, `today`, `week`, `stats`, `dashboard` |
 | [dashboard.py](dashboard.py) | HTTP server plus the entire single-page UI |
 | [pricing.py](pricing.py) | The one price table, and the user-override layer |

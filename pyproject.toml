@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tokenscope"
 dynamic = ["version"]
-description = "Token, cost, and session dashboard for Claude Code and Codex"
+description = "Token, cost, and session dashboard for Claude Code, Codex, and Antigravity"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -25,7 +25,7 @@ tokenscope = "cli:main"
 
 # Flat top-level modules, no package directory — mirror the repo layout.
 [tool.setuptools]
-py-modules = ["cli", "scanner", "dashboard", "pricing", "quota", "settings"]
+py-modules = ["cli", "scanner", "dashboard", "pricing", "quota", "settings", "sources", "antigravity"]
 
 [tool.setuptools.dynamic]
 version = { attr = "scanner.VERSION" }

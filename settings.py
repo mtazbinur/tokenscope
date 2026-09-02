@@ -10,7 +10,7 @@ Two things live here:
 
 - ``sources`` — which providers are active.  A disabled provider is hidden from
   the dashboard *and* skipped by ``scan``, so nothing about it is read, polled,
-  or stored.  Both are on by default.
+  or stored.  All known providers are on by default for new settings files.
 - ``pricing_overrides`` — per-source ``{model: rates}`` entries layered over
   ``pricing.PRICING_BY_SOURCE``.  This is how a model that ships later than the
   release gets a price without a code change, and how a user corrects a rate we
@@ -18,7 +18,7 @@ Two things live here:
   exact-match-then-longest-prefix resolution applies to them.
 
 Reads are deliberately forgiving (a corrupt or half-hand-edited file degrades to
-defaults rather than taking the dashboard down); writes coming from the settings
+  defaults rather than taking the dashboard down); writes coming from the settings
 page are strict, so bad input is rejected with a message instead of silently
 dropped.
 """
@@ -27,15 +27,13 @@ import json
 import os
 import tempfile
 from pathlib import Path
-
-SOURCE_CLAUDE = "claude_code"
-SOURCE_CODEX = "codex"
-KNOWN_SOURCES = (SOURCE_CLAUDE, SOURCE_CODEX)
+from sources import (SOURCE_CLAUDE, SOURCE_CODEX, SOURCE_ANTIGRAVITY,
+                     SOURCE_ORDER, KNOWN_SOURCES)
 
 SETTINGS_PATH = Path(os.environ.get(
     "TOKENSCOPE_SETTINGS", Path.home() / ".claude" / "tokenscope-settings.json"))
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Every price entry needs these four; they mirror pricing.py's entry shape.
 RATE_FIELDS = ("input", "output", "cache_read", "cache_write")
@@ -142,9 +140,24 @@ def normalize(raw, strict=False):
             raise SettingsError("Settings must be a JSON object.")
         return result
 
+    try:
+        # Browser writes are current-schema payloads even if a third-party
+        # caller omitted the version field. Versionless disk data is legacy
+        # schema v1 and receives the explicit upgrade behavior below.
+        raw_schema_version = int(raw.get(
+            "schema_version", SCHEMA_VERSION if strict else 1))
+    except (TypeError, ValueError):
+        raw_schema_version = 1
+    # Version 1 only knew about Claude Code and Codex.  Antigravity follows the
+    # product default on upgrade, so existing users receive the same enabled
+    # source set as a fresh install.  Ignore an Antigravity flag stamped with a
+    # pre-Antigravity schema version rather than treating it as authoritative.
+
     sources = raw.get("sources")
     if isinstance(sources, dict):
         for source in KNOWN_SOURCES:
+            if raw_schema_version < SCHEMA_VERSION and source == SOURCE_ANTIGRAVITY:
+                continue
             if source in sources:
                 result["sources"][source] = bool(sources[source])
     elif sources is not None and strict:
@@ -159,6 +172,8 @@ def normalize(raw, strict=False):
     overrides = raw.get("pricing_overrides")
     if isinstance(overrides, dict):
         for source, models in overrides.items():
+            if raw_schema_version < SCHEMA_VERSION and source == SOURCE_ANTIGRAVITY:
+                continue
             if source not in KNOWN_SOURCES:
                 if strict:
                     raise SettingsError(f"Unknown provider: {source}")
@@ -240,7 +255,20 @@ def enabled_sources(data=None):
     return active or list(KNOWN_SOURCES)
 
 
+def scan_sources(data=None):
+    """Return all enabled providers in canonical order for scanner.scan."""
+    return tuple(enabled_sources(data))
+
+
 def scan_source(data=None):
-    """Translate enabled providers into scanner.scan's ``source`` argument."""
+    """Compatibility wrapper for callers that still expect a scalar.
+
+    New code should use :func:`scan_sources`; a tuple is returned when a
+    partial multi-provider set is enabled so no source is silently skipped.
+    """
     active = enabled_sources(data)
-    return "all" if len(active) == len(KNOWN_SOURCES) else active[0]
+    if len(active) == len(KNOWN_SOURCES):
+        return "all"
+    if len(active) == 1:
+        return active[0]
+    return tuple(active)

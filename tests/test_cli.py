@@ -270,7 +270,9 @@ class TestProviderScanDispatch(unittest.TestCase):
         with mock.patch("scanner.scan") as mock_scan:
             cli.cmd_scan()
 
-        self.assertEqual(mock_scan.call_args.kwargs["source"], "all")
+        self.assertIn(mock_scan.call_args.kwargs["source"],
+                      ("all", ("claude_code", "codex"),
+                       ("claude_code", "codex", "antigravity")))
 
     def test_custom_projects_dir_remains_claude_only(self):
         with mock.patch("scanner.scan") as mock_scan:

@@ -6,6 +6,24 @@ and this file is the canonical version reference.
 TokenScope's history starts at v1.0.0 — the entries of the project it grew out of
 are not carried over here.
 
+## v1.2.1 — TBD
+
+### Antigravity
+
+- Added optional local Antigravity conversation-database ingestion with read-only SQLite access, strict stdlib protobuf decoding, WAL-aware incremental signatures, source-local staging, and transitive deduplication across retries and copied databases.
+- Added Antigravity provider settings, capability-driven dashboard tabs, underlying-model API-equivalent estimates, CLI path selection, and optional read-only Docker mounts. Antigravity quota limits are intentionally not fabricated.
+- Enabled Antigravity by default for both fresh settings and schema-v1 upgrades, while preserving an explicit opt-out that prevents future scans from walking its directories.
+- Excluded SQLite's mutable `-shm` coordination file from content signatures, preventing live conversation databases from being rejected as changed merely because the read itself refreshed shared-memory state.
+- Added explicit API-equivalent pricing for the current Antigravity model ids observed in local databases (`gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, and Claude Sonnet 4.6); private placeholders such as `gemini-default` remain intentionally unpriced.
+- Defaulted the model filter to **All models** so a newly observed or private model cannot hide otherwise valid usage merely because its price is still unknown.
+- Extracted each session's workspace path, git branch, and a title (from its first prompt) from the conversation database's `trajectory_metadata_blob` and opening `steps` row, replacing the flat `Antigravity` / empty-branch / "Untitled" placeholders shown in Recent Sessions and the Cost by Project(+Branch) tables. Bumped `ANTIGRAVITY_PARSER_REVISION` to `2` so existing installs backfill this on their next scan.
+- Stopped `gemini-default` (Antigravity's own "use whatever the client picked" routing tag) from surfacing as a distinct fake model — it now falls back to the session's last real model, the same treatment already given to unresolved internal ids.
+
+### Dashboard
+
+- Replaced the misleading five-minute SQLite-only refresh plus 30-minute rescan with one five-minute usage update that incrementally scans enabled providers and then reloads costs. Startup, manual, and automatic scans now share a process-wide coordinator, so concurrent dashboard tabs reuse the active scan instead of overlapping filesystem walks and SQLite writes.
+- Made each provider's Model pricing table in Settings collapsible, so a long Codex or Antigravity model list no longer forces you to scroll past it to reach the next section.
+
 ## v1.2.0 — 2026-09-01
 
 ### Dashboard

@@ -2,7 +2,7 @@
 cli.py - Command-line interface for the TokenScope dashboard.
 
 Commands:
-  scan      - Scan JSONL files and update the database
+  scan      - Scan local usage data and update the database
   today     - Print today's usage summary
   stats     - Print all-time usage statistics
   dashboard - Scan + open browser + start dashboard server
@@ -52,15 +52,18 @@ def require_db():
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
-def cmd_scan(projects_dir=None, source=None, codex_dir=None):
+def cmd_scan(projects_dir=None, source=None, codex_dir=None, antigravity_dir=None):
     from scanner import scan
     # A custom projects directory has historically meant Claude transcripts;
-    # the normal command scans both providers.
+    # the normal command scans all enabled providers.
     # With no explicit --source, honor the Settings page: a provider the user
     # switched off is never walked, so its directory isn't read at all.
-    resolved_source = source or (SOURCE_CLAUDE if projects_dir else settings.scan_source())
-    scan(projects_dir=Path(projects_dir) if projects_dir else None,
-         source=resolved_source, codex_dir=Path(codex_dir) if codex_dir else None)
+    resolved_source = source or (SOURCE_CLAUDE if projects_dir else settings.scan_sources())
+    if not source and not projects_dir and len(resolved_source) == len(settings.KNOWN_SOURCES):
+        resolved_source = "all"
+    return scan(projects_dir=Path(projects_dir) if projects_dir else None,
+                source=resolved_source, codex_dir=Path(codex_dir) if codex_dir else None,
+                antigravity_dir=antigravity_dir)
 
 
 def cmd_today():
@@ -129,8 +132,8 @@ def cmd_today():
     print()
     print(f"  Sessions today:   {sessions['cnt']}")
     print(f"  Subagent tokens:  {fmt(subagent['tokens'] or 0)}  ({fmt(subagent['turns'] or 0)} turns)")
-    print(f"  Cached input:     {fmt(total_cr)}  (included in Codex prompt input)")
-    print(f"  Cache writes:     {fmt(total_cc)}  (Codex logs may not report these)")
+    print(f"  Cache-read tokens: {fmt(total_cr)}  (provider-reported bucket)")
+    print(f"  Cache-write tokens: {fmt(total_cc)}  (provider-reported bucket)")
     hr()
     print()
     conn.close()
@@ -230,8 +233,8 @@ def cmd_week():
     print(f"    {'TOTAL':<30}  turns={total_turns:<4}  in={fmt(total_inp):<8}  out={fmt(total_out):<8}  cost={fmt_cost(total_cost)}")
     print()
     print(f"  Sessions this week:  {sessions['cnt']}")
-    print(f"  Cached input:        {fmt(total_cr)}  (included in Codex prompt input)")
-    print(f"  Cache writes:        {fmt(total_cc)}  (Codex logs may not report these)")
+    print(f"  Cache-read tokens:   {fmt(total_cr)}  (provider-reported bucket)")
+    print(f"  Cache-write tokens: {fmt(total_cc)}  (provider-reported bucket)")
     hr()
     print()
     conn.close()
@@ -343,10 +346,10 @@ def cmd_stats():
     print(f"  Total turns:      {fmt(totals['turns'] or 0)}")
     print(f"  Subagent turns:   {fmt(subagent['turns'] or 0)}")
     print()
-    print(f"  Input tokens:     {fmt(totals['inp'] or 0):<12}  (raw prompt tokens)")
+    print(f"  Input tokens:     {fmt(totals['inp'] or 0):<12}  (provider-reported input bucket)")
     print(f"  Output tokens:    {fmt(totals['out'] or 0):<12}  (generated tokens)")
-    print(f"  Cached input:     {fmt(totals['cr'] or 0):<12}  (included in Codex prompt input)")
-    print(f"  Cache writes:     {fmt(totals['cc'] or 0):<12}  (Codex logs may not report these)")
+    print(f"  Cache-read tokens: {fmt(totals['cr'] or 0):<12}  (provider-reported bucket)")
+    print(f"  Cache-write tokens: {fmt(totals['cc'] or 0):<12}  (provider-reported bucket)")
     print(f"  Subagent tokens:  {fmt(subagent['tokens'] or 0):<12}  (included in totals)")
     print()
     print(f"  Est. total cost:  ${total_cost:.4f}")
@@ -377,11 +380,16 @@ def cmd_stats():
 
 
 def cmd_dashboard(projects_dir=None, host=None, port=None, no_browser=False,
-                  source=None, codex_dir=None):
+                  source=None, codex_dir=None, antigravity_dir=None):
     import threading
     import time
 
-    from dashboard import serve
+    import dashboard
+    from dashboard import SCAN_COORDINATOR, serve
+
+    # The HTTP rescan endpoint runs after this function has dispatched the
+    # startup scan; retain an explicit Antigravity root for that later request.
+    dashboard.SCAN_ANTIGRAVITY_DIR = antigravity_dir
 
     host = host or os.environ.get("HOST", "localhost")
     port = int(port or os.environ.get("PORT", "8080"))
@@ -398,7 +406,10 @@ def cmd_dashboard(projects_dir=None, host=None, port=None, no_browser=False,
 
     def background_scan():
         print("Scanning in the background...")
-        scan(projects_dir=projects_dir, source=source, codex_dir=codex_dir)
+        SCAN_COORDINATOR.run(
+            lambda: scan(projects_dir=projects_dir, source=source, codex_dir=codex_dir,
+                         antigravity_dir=antigravity_dir)
+        )
         print("Background scan complete.")
 
     threading.Thread(target=background_scan, daemon=True).start()
@@ -422,12 +433,12 @@ USAGE = """
 TokenScope
 
 Usage:
-  python cli.py scan [--projects-dir PATH] [--source SOURCE] [--codex-dir PATH]
-                                                 Scan JSONL files and update database
+  python cli.py scan [--projects-dir PATH] [--source SOURCE] [--codex-dir PATH] [--antigravity-dir PATH]
+                                                 Scan local usage data and update database
   python cli.py today                        Show today's usage summary
   python cli.py week                         Show last 7 days (per-day + by-model)
   python cli.py stats                        Show all-time statistics
-  python cli.py dashboard [--projects-dir PATH] [--host HOST] [--port PORT] [--no-browser]
+  python cli.py dashboard [--projects-dir PATH] [--source SOURCE] [--codex-dir PATH] [--antigravity-dir PATH] [--host HOST] [--port PORT] [--no-browser]
                                                  Scan + start dashboard (opens a browser unless --no-browser)
   python cli.py --version                    Print the version and exit
 """
@@ -465,18 +476,21 @@ def main():
     projects_dir = parse_named_arg(rest, "--projects-dir")
     source = parse_named_arg(rest, "--source")
     codex_dir = parse_named_arg(rest, "--codex-dir")
+    antigravity_dir = parse_named_arg(rest, "--antigravity-dir")
 
     if command == "dashboard":
         cmd_dashboard(
             projects_dir=projects_dir,
             source=source,
             codex_dir=codex_dir,
+            antigravity_dir=antigravity_dir,
             host=parse_named_arg(rest, "--host"),
             port=parse_named_arg(rest, "--port"),
             no_browser="--no-browser" in rest,
         )
     elif command == "scan":
-        cmd_scan(projects_dir=projects_dir, source=source, codex_dir=codex_dir)
+        cmd_scan(projects_dir=projects_dir, source=source, codex_dir=codex_dir,
+                 antigravity_dir=antigravity_dir)
     else:
         COMMANDS[command]()
 

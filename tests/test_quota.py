@@ -90,6 +90,80 @@ class TestQuotaSnapshot(unittest.TestCase):
         self.assertEqual(snapshot["windows"][1]["remaining_percent"], 89.0)
         self.assertTrue(snapshot["windows"][0]["reset_at"].endswith("Z"))
 
+    def test_reads_antigravity_model_windows_from_local_server(self):
+        payload = {
+            "userStatus": {
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "modelOrAlias": {"model": "gemini-3-flash-high"},
+                            "label": "Gemini 3 Flash (High)",
+                            "quotaInfo": {"remainingFraction": 0.94, "resetTime": "2026-09-06T06:30:00Z"},
+                        },
+                        {
+                            "modelOrAlias": {"model": "gemini-3-flash-medium"},
+                            "label": "Gemini 3 Flash (Medium)",
+                            "quotaInfo": {"remainingFraction": 0.93, "resetTime": "2026-09-06T06:30:00Z"},
+                        },
+                        {
+                            "modelOrAlias": {"model": "gemini-3-pro-low"},
+                            "label": "Gemini 3 Pro (Low)",
+                            "quotaInfo": {"remainingFraction": 0.92, "resetTime": "2026-09-06T06:30:00Z"},
+                        },
+                        {
+                            "modelOrAlias": {"model": "claude-sonnet-4-6-thinking"},
+                            "label": "Claude Sonnet 4.6 (Thinking)",
+                            "quotaInfo": {"remainingFraction": 1, "resetTime": "2026-09-09T00:22:00Z"},
+                        },
+                        {
+                            "modelOrAlias": {"model": "gemini-2.5-flash-002"},
+                            "label": "Gemini 2.5 Flash",
+                            "quotaInfo": {"remainingFraction": 0.9},
+                        },
+                    ]
+                }
+            }
+        }
+        with patch("quota._antigravity_processes", return_value=[{"pid": 42, "port": 9999, "csrf_token": "token"}]), \
+             patch("quota._antigravity_ports", return_value=[9999]), \
+             patch("quota._antigravity_response", return_value=payload), \
+             patch("quota._ANTIGRAVITY_CACHE", None), \
+             patch("quota._ANTIGRAVITY_CACHE_AT", 0.0):
+            snapshot = get_quota_snapshot("antigravity", force_refresh=True)
+
+        self.assertTrue(snapshot["available"])
+        self.assertEqual(snapshot["source"], "antigravity_local")
+        self.assertEqual(snapshot["windows"], [
+            {
+                "key": "gemini-3-flash",
+                "label": "Gemini 3 Flash",
+                "remaining_percent": 93.0,
+                "reset_at": "2026-09-06T06:30:00Z",
+            },
+            {
+                "key": "gemini-3-pro",
+                "label": "Gemini 3 Pro",
+                "remaining_percent": 92.0,
+                "reset_at": "2026-09-06T06:30:00Z",
+            },
+            {
+                "key": "claude-sonnet-4-6",
+                "label": "Claude Sonnet 4.6",
+                "remaining_percent": 100.0,
+                "reset_at": "2026-09-09T00:22:00Z",
+            },
+        ])
+
+    def test_antigravity_panel_has_honest_unavailable_state_when_ide_is_closed(self):
+        with patch("quota._antigravity_processes", return_value=[]), \
+             patch("quota._ANTIGRAVITY_CACHE", None), \
+             patch("quota._ANTIGRAVITY_CACHE_AT", 0.0):
+            snapshot = get_quota_snapshot("antigravity", force_refresh=True)
+
+        self.assertFalse(snapshot["available"])
+        self.assertEqual(snapshot["windows"], [])
+        self.assertEqual(snapshot["message"], quota.ANTIGRAVITY_NOT_RUNNING_MESSAGE)
+
     def test_reads_claude_rate_limit_event(self):
         self.write_jsonl("claude.jsonl", [{
             "timestamp": "2026-08-31T06:20:00Z",

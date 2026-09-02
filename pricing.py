@@ -20,8 +20,7 @@ Sources:
   output once the prompt crosses 272K tokens.
 """
 
-SOURCE_CLAUDE = "claude_code"
-SOURCE_CODEX = "codex"
+from sources import SOURCE_CLAUDE, SOURCE_CODEX, SOURCE_ANTIGRAVITY
 
 # 272K prompt tokens is the documented cliff for every OpenAI family that has
 # one; crossing it reprices the entire request, not just the excess.
@@ -65,6 +64,31 @@ def _claude(input_rate, output_rate):
         "cache_read": round(input_rate * 0.1, 6),
         "cache_write": round(input_rate * 1.25, 6),
     }
+
+
+def _gemini(input_rate, output_rate, cache_read=None, cache_write=None,
+            long_context=None):
+    """Build a conservative API-equivalent Gemini entry.
+
+    Antigravity's counters are independent buckets, unlike Codex's inclusive
+    prompt counter.  Cache-write rates are intentionally explicit so this
+    source never inherits Codex's replacement arithmetic.
+    """
+    entry = {
+        "input": input_rate,
+        "output": output_rate,
+        "cache_read": input_rate if cache_read is None else cache_read,
+        "cache_write": input_rate if cache_write is None else cache_write,
+    }
+    if long_context:
+        entry.update({
+            "long_context_threshold": long_context[0],
+            "long_input": long_context[1],
+            "long_output": long_context[2],
+            "long_cache_read": long_context[3],
+            "long_cache_write": long_context[4],
+        })
+    return entry
 
 
 PRICING_BY_SOURCE = {
@@ -118,6 +142,31 @@ PRICING_BY_SOURCE = {
         "gpt-5-mini": _openai(0.25, 2.00, long_context=False),
         "gpt-5-nano": _openai(0.05, 0.40, long_context=False),
         "gpt-5": _openai(1.25, 10.00, long_context=False),
+    },
+    # Underlying Google/Anthropic API-equivalent estimates only.  These are
+    # not Antigravity plan charges; unknown/private model ids stay unpriced.
+    SOURCE_ANTIGRAVITY: {
+        "gemini-2.5-pro": _gemini(
+            1.25, 10.00, cache_read=0.125, cache_write=1.25,
+            long_context=(200_000, 2.50, 15.00, 0.25, 2.50)),
+        "gemini-2.5-flash": _gemini(0.30, 2.50, cache_read=0.03, cache_write=0.30),
+        "gemini-2.5-flash-thinking": _gemini(0.30, 2.50, cache_read=0.03, cache_write=0.30),
+        "gemini-3-flash-preview": _gemini(0.50, 3.00, cache_read=0.05, cache_write=0.50),
+        # Introductory standard rates through 2026-12-31. Keep these explicit
+        # rather than letting newer Flash ids inherit an older family price.
+        "gemini-3.7-flash": _gemini(0.75, 3.75, cache_read=0.075, cache_write=0.75),
+        "gemini-3.6-flash": _gemini(0.75, 3.75, cache_read=0.075, cache_write=0.75),
+        "gemini-3.5-flash": _gemini(1.50, 9.00, cache_read=0.15, cache_write=1.50),
+        "gemini-3-pro": _gemini(
+            2.00, 12.00, cache_read=0.20, cache_write=2.00,
+            long_context=(200_000, 4.00, 18.00, 0.40, 4.00)),
+        "gemini-3-pro-low": _gemini(2.00, 12.00, cache_read=0.20, cache_write=2.00),
+        "gemini-3-pro-high": _gemini(2.00, 12.00, cache_read=0.20, cache_write=2.00),
+        "claude-4-sonnet": _claude(3.00, 15.00),
+        "claude-4-opus": _claude(15.00, 75.00),
+        "claude-opus-4-5": _claude(5.00, 25.00),
+        "claude-opus-4-6": _claude(5.00, 25.00),
+        "claude-sonnet-4-6": _claude(3.00, 15.00),
     },
 }
 

@@ -3,7 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # Every runtime module: dashboard.py imports pricing, quota and settings.
-COPY scanner.py cli.py dashboard.py pricing.py quota.py settings.py ./
+COPY scanner.py cli.py dashboard.py pricing.py quota.py settings.py sources.py antigravity.py ./
 COPY resources ./resources
 
 ENV HOST=0.0.0.0

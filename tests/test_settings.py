@@ -1,6 +1,7 @@
 """Tests for settings.py and the dashboard's settings endpoints."""
 
 import json
+import itertools
 import sys
 import tempfile
 import threading
@@ -20,8 +21,8 @@ from dashboard import DashboardHandler
 class TestDefaults(unittest.TestCase):
     def test_both_providers_on_by_default(self):
         data = settings.defaults()
-        self.assertEqual(data["sources"], {"claude_code": True, "codex": True})
-        self.assertEqual(data["pricing_overrides"], {"claude_code": {}, "codex": {}})
+        self.assertEqual(data["sources"], {"claude_code": True, "codex": True, "antigravity": True})
+        self.assertEqual(data["pricing_overrides"], {"claude_code": {}, "codex": {}, "antigravity": {}})
 
     def test_defaults_are_not_shared_state(self):
         first = settings.defaults()
@@ -40,6 +41,28 @@ class TestDefaults(unittest.TestCase):
 
 
 class TestNormalizeSources(unittest.TestCase):
+    def test_schema_v1_enables_antigravity_by_default_on_upgrade(self):
+        data = settings.normalize({
+            "schema_version": 1,
+            "sources": {"claude_code": True, "codex": True, "antigravity": False},
+            "pricing_overrides": {"antigravity": {
+                "gemini-2.5-flash": {
+                    "input": 1, "output": 1, "cache_read": 1, "cache_write": 1,
+                },
+            }},
+        })
+        self.assertEqual(data["schema_version"], settings.SCHEMA_VERSION)
+        self.assertTrue(data["sources"]["antigravity"])
+        self.assertEqual(data["pricing_overrides"]["antigravity"], {})
+
+    def test_every_non_empty_enabled_source_combination_is_preserved(self):
+        sources = tuple(settings.KNOWN_SOURCES)
+        for size in range(1, len(sources) + 1):
+            for enabled in itertools.combinations(sources, size):
+                raw = {"schema_version": 2, "sources": {
+                    source: source in enabled for source in sources}}
+                self.assertEqual(settings.scan_sources(raw), enabled)
+
     def test_only_explicit_false_disables(self):
         data = settings.normalize({"sources": {"codex": False}})
         self.assertTrue(data["sources"]["claude_code"])
@@ -47,17 +70,23 @@ class TestNormalizeSources(unittest.TestCase):
 
     def test_unknown_provider_is_ignored(self):
         data = settings.normalize({"sources": {"gemini": True}})
-        self.assertEqual(sorted(data["sources"]), ["claude_code", "codex"])
+        self.assertEqual(sorted(data["sources"]), ["antigravity", "claude_code", "codex"])
 
     def test_all_disabled_falls_back_to_defaults_on_read(self):
         # A hand-edited file must not be able to leave the dashboard with
         # nothing to show and no UI left to fix it.
-        data = settings.normalize({"sources": {"claude_code": False, "codex": False}})
-        self.assertEqual(data["sources"], {"claude_code": True, "codex": True})
+        data = settings.normalize({
+            "schema_version": 2,
+            "sources": {"claude_code": False, "codex": False, "antigravity": False},
+        })
+        self.assertEqual(data["sources"], {"claude_code": True, "codex": True, "antigravity": True})
 
     def test_all_disabled_is_rejected_on_write(self):
         with self.assertRaises(settings.SettingsError):
-            settings.normalize({"sources": {"claude_code": False, "codex": False}}, strict=True)
+            settings.normalize({
+                "schema_version": 2,
+                "sources": {"claude_code": False, "codex": False, "antigravity": False},
+            }, strict=True)
 
     def test_non_dict_payload(self):
         self.assertEqual(settings.normalize("nope"), settings.defaults())
@@ -143,7 +172,11 @@ class TestSaveAndLoad(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "settings.json"
             with self.assertRaises(settings.SettingsError):
-                settings.save({"sources": {"claude_code": False, "codex": False}}, path=target)
+                settings.save({"sources": {
+                    "claude_code": False,
+                    "codex": False,
+                    "antigravity": False,
+                }}, path=target)
             self.assertFalse(target.exists())
 
     def test_save_leaves_no_temp_files_behind(self):
@@ -156,20 +189,26 @@ class TestSaveAndLoad(unittest.TestCase):
 class TestEnabledSources(unittest.TestCase):
     def test_order_is_canonical(self):
         self.assertEqual(settings.enabled_sources(settings.defaults()),
-                         ["claude_code", "codex"])
+                         ["claude_code", "codex", "antigravity"])
 
     def test_single_provider(self):
-        data = settings.normalize({"sources": {"claude_code": False}})
+        data = settings.normalize({
+            "schema_version": 2,
+            "sources": {"claude_code": False, "codex": True, "antigravity": False},
+        })
         self.assertEqual(settings.enabled_sources(data), ["codex"])
 
     def test_scan_source_maps_to_scanner_argument(self):
         self.assertEqual(settings.scan_source(settings.defaults()), "all")
-        one = settings.normalize({"sources": {"codex": False}})
+        one = settings.normalize({
+            "schema_version": 2,
+            "sources": {"claude_code": True, "codex": False, "antigravity": False},
+        })
         self.assertEqual(settings.scan_source(one), "claude_code")
 
     def test_empty_flags_never_yield_no_provider(self):
         self.assertEqual(settings.enabled_sources({"sources": {}}),
-                         ["claude_code", "codex"])
+                         ["claude_code", "codex", "antigravity"])
 
 
 class TestPricingOverrideLayer(unittest.TestCase):
@@ -281,7 +320,7 @@ class TestSettingsEndpoints(unittest.TestCase):
         self.assertEqual(payload["settings"], settings.defaults())
         self.assertIn("claude-opus-5", payload["builtin_pricing"]["claude_code"])
         self.assertEqual(payload["rate_fields"], list(settings.RATE_FIELDS))
-        self.assertEqual(sorted(payload["sources"]), ["claude_code", "codex"])
+        self.assertEqual(sorted(payload["sources"]), ["antigravity", "claude_code", "codex"])
 
     def test_displayed_path_is_home_relative(self):
         # The path is rendered on the page (and in screenshots), so it must not
@@ -317,7 +356,11 @@ class TestSettingsEndpoints(unittest.TestCase):
 
     def test_post_rejects_disabling_every_provider(self):
         status, payload = self._post(
-            "/api/settings", {"sources": {"claude_code": False, "codex": False}})
+            "/api/settings", {"sources": {
+                "claude_code": False,
+                "codex": False,
+                "antigravity": False,
+            }})
         self.assertEqual(status, 400)
         self.assertIn("at least one", payload["error"].lower())
 

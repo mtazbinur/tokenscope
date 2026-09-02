@@ -1,4 +1,4 @@
-"""Read provider quota snapshots from Claude Code and Codex sources."""
+"""Read provider quota snapshots from Claude Code, Codex, and Antigravity."""
 
 import glob
 import json
@@ -6,6 +6,7 @@ import os
 import shutil
 import re
 import subprocess
+import ssl
 import threading
 import time
 import urllib.error
@@ -14,10 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SOURCE_CLAUDE = "claude_code"
-SOURCE_CODEX = "codex"
+from sources import SOURCE_CLAUDE, SOURCE_CODEX, SOURCE_ANTIGRAVITY
 
 _CACHE = {}
+_ANTIGRAVITY_CACHE = None
+_ANTIGRAVITY_CACHE_AT = 0.0
+ANTIGRAVITY_CACHE_SECONDS = 60
 _CLAUDE_API_CACHE = None
 _CLAUDE_API_CACHE_AT = 0.0
 CLAUDE_API_CACHE_SECONDS = 60
@@ -46,6 +49,201 @@ RATE_LIMITED_MESSAGE = "Claude's usage endpoint is busy — showing the last rea
 NETWORK_MESSAGE = "Could not reach Claude's usage endpoint"
 CREDENTIAL_STALE_MESSAGE = "Could not confirm the Claude Code sign-in"
 NO_READING_YET_MESSAGE = "Waiting for Claude's first usage reading"
+ANTIGRAVITY_NOT_RUNNING_MESSAGE = "Open Antigravity to load live model limits"
+ANTIGRAVITY_UNAVAILABLE_MESSAGE = "Could not read live model limits from Antigravity"
+
+
+def _command_argument(command_line, name):
+    """Return one command-line argument without exposing the rest of the process."""
+    match = re.search(
+        re.escape(name) + r"(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))",
+        command_line,
+    )
+    if not match:
+        return None
+    return next((value for value in match.groups() if value is not None), None)
+
+
+def _antigravity_processes():
+    """Find Antigravity language-server processes and their local auth hints."""
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+                ],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            raw = json.loads(result.stdout or "[]")
+            rows = raw if isinstance(raw, list) else [raw]
+            candidates = [
+                (int(row.get("ProcessId", 0)), str(row.get("CommandLine") or ""))
+                for row in rows if isinstance(row, dict)
+            ]
+        else:
+            result = subprocess.run(
+                ["ps", "-axo", "pid=,command="],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+            candidates = []
+            for line in (result.stdout or "").splitlines():
+                pid_text, separator, command = line.strip().partition(" ")
+                if separator and pid_text.isdigit():
+                    candidates.append((int(pid_text), command.strip()))
+    except (OSError, ValueError, json.JSONDecodeError, subprocess.SubprocessError):
+        return []
+
+    found = []
+    for pid, command in candidates:
+        lower = command.lower()
+        if "antigravity" not in lower or not any(signal in lower for signal in (
+            "language-server", "language_server", "--csrf_token", "--extension_server_port",
+        )):
+            continue
+        raw_port = _command_argument(command, "--extension_server_port")
+        port = int(raw_port) if raw_port and raw_port.isdigit() else None
+        found.append({
+            "pid": pid,
+            "csrf_token": _command_argument(command, "--csrf_token"),
+            "port": port,
+        })
+    return found
+
+
+def _antigravity_ports(process):
+    """Return known listening ports for one language server, preferred first."""
+    ports = [process["port"]] if process.get("port") else []
+    if os.name == "nt":
+        return ports
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-a", "-p", str(process["pid"]), "-iTCP", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ports
+    for match in re.finditer(r":(\d+)\s+\(LISTEN\)", result.stdout or ""):
+        port = int(match.group(1))
+        if port not in ports:
+            ports.append(port)
+    return ports
+
+
+def _antigravity_response(port, csrf_token, scheme):
+    endpoint = "/exa.language_server_pb.LanguageServerService/GetUserStatus"
+    request = urllib.request.Request(
+        f"{scheme}://127.0.0.1:{port}{endpoint}",
+        data=json.dumps({
+            "metadata": {"ideName": "antigravity", "extensionName": "antigravity", "locale": "en"},
+        }).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Connect-Protocol-Version": "1",
+            **({"X-Codeium-Csrf-Token": csrf_token} if csrf_token else {}),
+        },
+        method="POST",
+    )
+    context = ssl._create_unverified_context() if scheme == "https" else None
+    with urllib.request.urlopen(request, timeout=2, context=context) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _antigravity_windows(payload):
+    if not isinstance(payload, dict):
+        return []
+    user_status = payload.get("userStatus", payload)
+    if not isinstance(user_status, dict):
+        return []
+    cascade = user_status.get("cascadeModelConfigData")
+    models = cascade.get("clientModelConfigs") if isinstance(cascade, dict) else None
+    if not isinstance(models, list):
+        return []
+
+    grouped = {}
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_or_alias = model.get("modelOrAlias")
+        model_id = model_or_alias.get("model") if isinstance(model_or_alias, dict) else None
+        label = model.get("label") if isinstance(model.get("label"), str) else model_id
+        # Match Antigravity's focused view: the 2.5 entries are autocomplete
+        # helpers and otherwise drown out the model limits users care about.
+        if not isinstance(model_id, str) or "gemini-2.5" in model_id or "Gemini 2.5" in str(label):
+            continue
+        info = model.get("quotaInfo")
+        fraction = _as_number(info.get("remainingFraction")) if isinstance(info, dict) else None
+        if fraction is None:
+            continue
+        quota_label = re.sub(
+            r"\s*\((?:high|medium|low|thinking)\)\s*$",
+            "",
+            str(label or model_id),
+            flags=re.IGNORECASE,
+        ).strip()
+        quota_key = re.sub(
+            r"[-_](?:high|medium|low|thinking)$",
+            "",
+            model_id,
+            flags=re.IGNORECASE,
+        )
+        group_key = quota_label.casefold()
+
+        candidate = {
+            "key": quota_key,
+            "label": quota_label,
+            "remaining_percent": round(_clamp_percent(fraction * 100), 1),
+            "reset_at": _iso_timestamp(info.get("resetTime")),
+        }
+        current = grouped.get(group_key)
+        # Antigravity repeats a model's shared allowance for every thinking
+        # preset. Keep each distinct model, collapse only those effort variants,
+        # and show the most constrained copy if a refresh briefly disagrees.
+        if current is None or candidate["remaining_percent"] < current["remaining_percent"]:
+            grouped[group_key] = candidate
+    return list(grouped.values())
+
+
+def _antigravity_snapshot(force_refresh=False):
+    """Read model quotas from the running Antigravity language server."""
+    global _ANTIGRAVITY_CACHE, _ANTIGRAVITY_CACHE_AT
+    now = time.monotonic()
+    if not force_refresh and _ANTIGRAVITY_CACHE is not None and now - _ANTIGRAVITY_CACHE_AT < ANTIGRAVITY_CACHE_SECONDS:
+        return _ANTIGRAVITY_CACHE
+
+    processes = _antigravity_processes()
+    if not processes:
+        return {
+            "available": False, "windows": [], "updated_at": None,
+            "source": "unavailable", "message": ANTIGRAVITY_NOT_RUNNING_MESSAGE,
+        }
+
+    for process in processes:
+        for port in _antigravity_ports(process):
+            for scheme in ("https", "http"):
+                try:
+                    payload = _antigravity_response(port, process.get("csrf_token"), scheme)
+                except (OSError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, ValueError):
+                    continue
+                windows = _antigravity_windows(payload)
+                if not windows:
+                    continue
+                snapshot = {
+                    "available": True,
+                    "windows": windows,
+                    "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "source": "antigravity_local",
+                    "message": "Live usage from Antigravity",
+                }
+                _ANTIGRAVITY_CACHE = snapshot
+                _ANTIGRAVITY_CACHE_AT = now
+                return snapshot
+
+    return {
+        "available": False, "windows": [], "updated_at": None,
+        "source": "unavailable", "message": ANTIGRAVITY_UNAVAILABLE_MESSAGE,
+    }
 
 
 def _as_number(value):
@@ -717,6 +915,8 @@ def _codex_events(record):
 
 
 def _read_file(path, source):
+    if source not in (SOURCE_CLAUDE, SOURCE_CODEX):
+        return []
     events = []
     try:
         with open(path, encoding="utf-8", errors="replace") as stream:
@@ -756,6 +956,11 @@ def get_quota_snapshot(source, claude_dirs=None, codex_dir=None, force_refresh=F
     The file-level cache avoids rereading unchanged transcript history on every
     dashboard refresh while still noticing newly appended usage snapshots.
     """
+    if source == SOURCE_ANTIGRAVITY:
+        return _antigravity_snapshot(force_refresh=force_refresh)
+
+    if source not in (SOURCE_CLAUDE, SOURCE_CODEX):
+        return None
     paths = _source_files(source, claude_dirs=claude_dirs, codex_dir=codex_dir)
     signature = []
     for path in paths:
